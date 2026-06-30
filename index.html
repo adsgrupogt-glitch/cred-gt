@@ -736,6 +736,7 @@ function App() {
   const [repasses, setRepasses] = useState([]); // histórico de quinzenas de crédito
   const [planoValor, setPlanoValor] = useState(PLANO_VALOR_PADRAO);
   const [comissaoPct, setComissaoPct] = useState(COMISSAO_PCT_PADRAO);
+  const [metaMensal, setMetaMensal] = useState(1400);
   const [campanhas, setCampanhas] = useState([]);
   const [loading, setLoading] = useState("");
   const [toast, setToast] = useState(null);
@@ -763,6 +764,7 @@ function App() {
       }
       if (cfg?.planoValor) setPlanoValor(cfg.planoValor);
       if (cfg?.comissaoPct != null) setComissaoPct(cfg.comissaoPct);
+      if (cfg?.metaMensal != null) setMetaMensal(cfg.metaMensal);
       if (cps && cps.length) setCampanhas(cps);
       else { setCampanhas(SEED_CAMPANHAS); await store.set(STORAGE_KEYS.campanhas, SEED_CAMPANHAS); }
       const precisaSeed = !us || cfg?.seedVersion !== SEED_VERSION;
@@ -872,7 +874,8 @@ function App() {
   const updateConfig = async (patch) => {
     if (patch.planoValor != null) setPlanoValor(patch.planoValor);
     if (patch.comissaoPct != null) setComissaoPct(patch.comissaoPct);
-    const cfg = { planoValor: patch.planoValor ?? planoValor, comissaoPct: patch.comissaoPct ?? comissaoPct, seedVersion: SEED_VERSION };
+    if (patch.metaMensal != null) setMetaMensal(patch.metaMensal);
+    const cfg = { planoValor: patch.planoValor ?? planoValor, comissaoPct: patch.comissaoPct ?? comissaoPct, metaMensal: patch.metaMensal ?? metaMensal, seedVersion: SEED_VERSION };
     await store.set(STORAGE_KEYS.config, cfg);
   };
   const updatePlano = (v) => updateConfig({ planoValor: v });
@@ -1040,12 +1043,89 @@ function App() {
       recorrentesCreditadas: recorrentes.filter((v) => v.statusCred === "CREDITADO").length,
     };
 
+    /* ====================== ANALYTICS (base 04/2026+) ====================== */
+    const MES_CORTE = "2026-04"; // iBridge só é confiável a partir daqui
+    const qIdx = (iso) => { const [y, m, d] = String(iso).split("-").map(Number); return (y * 12 + (m - 1)) * 2 + (d >= 16 ? 1 : 0); };
+
+    // Vendas iBridge por mês (entrada) e por dia
+    const vendasMesMap = new Map();
+    for (const v of ibridge) { if (!v.mesISO) continue; vendasMesMap.set(v.mesISO, (vendasMesMap.get(v.mesISO) || 0) + 1); }
+    const vendasPorMes = [...vendasMesMap.entries()].filter(([m]) => m >= MES_CORTE).sort().map(([mes, qtd]) => ({ mes, label: labelMes(mes), qtd }));
+
+    // Entrada (1ª venda) por CPF e mês de entrada
+    const entradaCpf = new Map();
+    for (const v of ibridge) { if (!v.cpf || !v.dataISO) continue; const c = entradaCpf.get(v.cpf); if (!c || v.dataISO < c) entradaCpf.set(v.cpf, v.dataISO); }
+
+    // Taxa de aprovação na auditoria (real)
+    const audTotal = auditoria.length;
+    const audAprov = auditoria.filter((a) => a.status === "APROVADA").length;
+    const taxaAprovacao = audTotal ? audAprov / audTotal : 0;
+
+    // Safras: por mês de entrada -> entraram, creditaram (1ª quitação), curva de maturação
+    const safrasMap = new Map();
+    for (const [cpf, vendaISO] of entradaCpf) {
+      const mes = mesDeISO(vendaISO); if (mes < MES_CORTE) continue;
+      const s = safrasMap.get(mes) || { mes, entradas: 0, creditaram: 0, lags: {} };
+      s.entradas += 1;
+      const ci = credInfo.get(cpf);
+      if (ci && ci.primeiroISO) {
+        s.creditaram += 1;
+        const lag = qIdx(ci.primeiroISO) - qIdx(vendaISO);
+        if (lag >= 0 && lag <= 8) s.lags[lag] = (s.lags[lag] || 0) + 1;
+      }
+      safrasMap.set(mes, s);
+    }
+    const safras = [...safrasMap.values()].sort((a, b) => a.mes.localeCompare(b.mes)).map((s) => ({
+      ...s, label: labelMes(s.mes), conversao: s.entradas ? s.creditaram / s.entradas : 0,
+    }));
+
+    // Curva de maturação consolidada (fração da safra que credita em +k quinzenas) — usa safras maduras
+    const curvaAcc = {}; let baseSafra = 0;
+    for (const s of safras) {
+      // só safras com idade >= 4 quinzenas contam para a curva "madura"
+      const idade = ibridge.length ? (qIdx((carteira[carteira.length - 1]?.periodoFim) || mesAtualISO() + "-15") - qIdx(s.mes + "-01")) : 0;
+      if (idade >= 4) { baseSafra += s.entradas; for (const k in s.lags) curvaAcc[k] = (curvaAcc[k] || 0) + s.lags[k]; }
+    }
+    const curvaMaturacao = {}; // k -> fração média da safra
+    if (baseSafra > 0) for (const k in curvaAcc) curvaMaturacao[k] = curvaAcc[k] / baseSafra;
+    const taxaConvMadura = Object.values(curvaMaturacao).reduce((a, b) => a + b, 0) || 0.27;
+
+    // Retenção média da carteira (recorrentes da quinzena / quitadas da quinzena anterior)
+    let retSum = 0, retN = 0;
+    for (let i = 1; i < carteira.length; i++) {
+      if (carteira[i - 1].quitadas > 0) { retSum += carteira[i].recorrentes / carteira[i - 1].quitadas; retN++; }
+    }
+    const retencaoMedia = retN ? retSum / retN : 0.7;
+
+    // Performance por operador (volume, aprovação, crédito) — base 04/2026+
+    const opMap = new Map();
+    for (const v of enriched) {
+      if (!v.operador || (v.mesISO && v.mesISO < MES_CORTE)) continue;
+      const o = opMap.get(v.operador) || { operador: v.operador, vendas: 0, aprovadas: 0, recusadas: 0, creditadas: 0 };
+      o.vendas += 1;
+      if (v.statusAud === "APROVADA") o.aprovadas += 1;
+      if (v.statusAud === "RECUSADA") o.recusadas += 1;
+      if (v.statusCred === "CREDITADO") o.creditadas += 1;
+      opMap.set(v.operador, o);
+    }
+    const porOperador = [...opMap.values()].map((o) => ({ ...o, taxaAprov: o.vendas ? o.aprovadas / o.vendas : 0 })).sort((a, b) => b.vendas - a.vendas);
+
+    // Motivos de recusa (top)
+    const motivosMap = new Map();
+    for (const a of auditoria) { if (a.status !== "RECUSADA" || !a.motivo) continue; const k = a.motivo.trim().slice(0, 70); motivosMap.set(k, (motivosMap.get(k) || 0) + 1); }
+    const motivosRecusa = [...motivosMap.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([motivo, n]) => ({ motivo, n }));
+
+    const analytics = {
+      mesCorte: MES_CORTE, vendasPorMes, taxaAprovacao, audTotal, audAprov,
+      safras, curvaMaturacao, taxaConvMadura, retencaoMedia, porOperador, motivosRecusa, qIdx,
+    };
+
     return {
       enriched, audSemIb, ibSemAud, repSemAud, funnel,
       audByCpf, repByCpf, ibByCpf, aprovadasCpf, credInfo,
       temRepasses, carteira, carteiraTotal, aReceber, estTotal, clientesCreditados, quitacoesTotal, ultimaQuinzena,
       repTotal: carteiraTotal, valorAReceber: aReceber, creditadosBanco: clientesCreditados,
-      receitaPorVenda, comissao, comissaoRecorrenteMes, rec,
+      receitaPorVenda, comissao, comissaoRecorrenteMes, rec, analytics,
     };
   }, [ibridge, auditoria, repasses, planoValor, comissaoPct, campanhas]);
 
@@ -1122,7 +1202,7 @@ function App() {
           {menuAtivo === "ibridge" && <IbridgeView model={model} ibridge={ibridge} onUpload={(f) => handleUpload(f, "ibridge")} onClear={() => clearKind("ibridge")} loading={loading === "ibridge"} />}
           {menuAtivo === "auditadas" && <AuditadasView model={model} auditoria={auditoria} onUpload={(f) => handleUpload(f, "auditoria")} onClear={() => clearKind("auditoria")} loading={loading === "auditoria"} />}
           {menuAtivo === "creditadas" && <CreditadasView model={model} repasses={repasses} lerQuinzena={lerQuinzena} onAdd={addQuinzena} onRemove={removeQuinzena} onClear={() => clearKind("repasse")} sessao={sessao} flash={flash} />}
-          {menuAtivo === "projecao" && <ProjecaoView model={model} planoValor={planoValor} comissaoPct={comissaoPct} campanhas={campanhas} />}
+          {menuAtivo === "projecao" && <ProjecaoView model={model} planoValor={planoValor} comissaoPct={comissaoPct} campanhas={campanhas} metaMensal={metaMensal} setConfig={updateConfig} />}
           {menuAtivo === "campanhas" && <CampanhasView campanhas={campanhas} setCampanhas={persistCampanhas} planoValor={planoValor} comissaoPct={comissaoPct} setConfig={updateConfig} sessao={sessao} flash={flash} />}
           {menuAtivo === "relatorios" && <RelatoriosView model={model} repasses={repasses} />}
           {menuAtivo === "usuarios" && <UsuariosView users={users} setUsers={persistUsers} sessao={sessao} flash={flash} />}
@@ -1528,31 +1608,22 @@ function EmptyState({ icon: Icon, title, desc, action }) {
 /* ---------- Dashboard ---------- */
 function DashboardView({ model, planoValor, comissaoPct, setConfig, temDados, go }) {
   const f = model.funnel;
-  const taxaAprov = f.clientesUnicos ? f.aprovadas / f.clientesUnicos : 0;
-  const taxaCred = f.aprovadas ? f.creditadas / f.aprovadas : 0;
-  const taxaGlobal = f.clientesUnicos ? f.creditadas / f.clientesUnicos : 0;
+  const A = model.analytics;
+  const taxaAprov = A.taxaAprovacao;
+  const vendasPeriodo = A.vendasPorMes.reduce((s, v) => s + v.qtd, 0);
+  const estornosQtd = model.carteira.reduce((s, q) => s + q.estornos, 0);
 
-  // Vendas por dia (fechamentos)
-  const porDia = useMemo(() => {
-    const m = new Map();
-    for (const v of model.enriched) {
-      if (!v.dataISO) continue;
-      m.set(v.dataISO, (m.get(v.dataISO) || 0) + 1);
-    }
-    return [...m.entries()].sort().map(([iso, n]) => ({ dia: brFromISO(iso).slice(0, 5), fechamentos: n }));
-  }, [model]);
+  // Evolução da carteira por quinzena (valor + quitadas)
+  const evolCarteira = useMemo(() => model.carteira.map((q) => ({
+    label: labelMes(mesDeISO(q.periodoFim || q.periodoIni)) + (String(q.periodoFim).endsWith("15") ? " Q1" : " Q2"),
+    valor: q.valorCreditado, quitadas: q.quitadas, novas: q.novas, recorrentes: q.recorrentes,
+  })), [model]);
 
-  // Top operadores por aprovação
-  const porOperador = useMemo(() => {
-    const m = new Map();
-    for (const v of model.enriched) {
-      const k = v.operador || "—";
-      const o = m.get(k) || { operador: k, total: 0, aprovadas: 0 };
-      o.total++; if (v.statusAud === "APROVADA") o.aprovadas++;
-      m.set(k, o);
-    }
-    return [...m.values()].sort((a, b) => b.total - a.total).slice(0, 8);
-  }, [model]);
+  // Conversão por safra
+  const safrasChart = useMemo(() => A.safras.map((s) => ({ label: s.label, entradas: s.entradas, creditaram: s.creditaram, conv: Math.round(s.conversao * 100) })), [A]);
+
+  // Vendas iBridge por mês
+  const vendasMesChart = useMemo(() => A.vendasPorMes.map((v) => ({ label: v.label, vendas: v.qtd })), [A]);
 
   const retornoPie = useMemo(() => {
     const m = new Map();
@@ -1568,7 +1639,7 @@ function DashboardView({ model, planoValor, comissaoPct, setConfig, temDados, go
       <>
         <PageHeader title="Dashboard" desc="Visão geral do funil de vendas Cred GT." />
         <EmptyState icon={LayoutDashboard} title="Comece enviando as planilhas"
-          desc="Suba a planilha do iBridge para iniciar. Depois, a Auditoria e o Repasse — o funil é montado automaticamente pelo CPF."
+          desc="Suba a planilha do iBridge para iniciar. Depois, a Auditoria e as quinzenas de Crédito — o funil é montado automaticamente pelo CPF."
           action={<button onClick={() => go("ibridge")} className="mt-4 rounded-lg px-4 py-2 text-sm font-medium text-white" style={{ background: BRAND.blue }}>Ir para Vendas iBridge</button>} />
       </>
     );
@@ -1576,7 +1647,7 @@ function DashboardView({ model, planoValor, comissaoPct, setConfig, temDados, go
 
   return (
     <>
-      <PageHeader title="Dashboard" desc="Funil completo: do fechamento no call center até o crédito em conta."
+      <PageHeader title="Dashboard" desc="Operação Sempre Odonto · indicadores com base nas vendas a partir de 04/2026 (quando o iBridge passou a ser confiável)."
         right={
           <div className="flex flex-wrap items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm">
             <span className="text-slate-500">Valor plano (R$)</span>
@@ -1590,46 +1661,46 @@ function DashboardView({ model, planoValor, comissaoPct, setConfig, temDados, go
           </div>
         } />
 
-      {/* KPIs */}
+      {/* Linha 1 — Topo do funil + carteira (a verdade do negócio) */}
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <Kpi icon={Phone} tone="sky" label="Fechamentos iBridge" value={fmtInt(f.fechamentosRegistros)} sub={`${fmtInt(f.clientesUnicos)} clientes únicos`} />
-        <Kpi icon={ShieldCheck} tone="emerald" label="Aprovadas auditoria" value={fmtInt(f.aprovadas)} sub={`Aprovação ${fmtPct(taxaAprov)}`} />
-        <Kpi icon={CreditCard} tone="violet" label="Creditadas (vidas)" value={fmtInt(f.creditadas)} sub={`Conversão venda→crédito ${fmtPct(taxaGlobal)}`} />
-        <Kpi icon={Wallet} tone="emerald" label="Carteira (repasse total)" value={fmtBRL(model.carteiraTotal)} sub={`${fmtInt(model.carteira.length)} quinzenas`} />
+        <Kpi icon={Phone} tone="sky" label="Vendas iBridge (abr/26+)" value={fmtInt(vendasPeriodo)} sub={`${fmtInt(f.clientesUnicos)} CPFs únicos`} />
+        <Kpi icon={ShieldCheck} tone="emerald" label="Taxa de aprovação" value={fmtPct(taxaAprov)} sub={`${fmtInt(A.audAprov)}/${fmtInt(A.audTotal)} na auditoria`} />
+        <Kpi icon={Users} tone="blue" label="Carteira ativa" value={fmtInt(model.clientesCreditados)} sub="CPFs já creditados" />
+        <Kpi icon={Wallet} tone="emerald" label="Repasse recebido (30%)" value={fmtBRL(model.carteiraTotal)} sub={`${fmtInt(model.carteira.length)} quinzenas`} />
       </div>
+
+      {/* Linha 2 — Carteira / recorrência */}
       <div className="mt-3 grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <Kpi icon={XCircle} tone="rose" label="Recusadas auditoria" value={fmtInt(f.recusadas)} />
+        <Kpi icon={Repeat} tone="violet" label="Quitações no total" value={fmtInt(model.quitacoesTotal)} sub="1ª venda + recorrências" />
+        <Kpi icon={TrendingUp} tone="teal" label="Retenção da carteira" value={fmtPct(A.retencaoMedia)} sub="recorrência por quinzena" />
+        <Kpi icon={Clock} tone="amber" label="A receber" value={fmtBRL(model.aReceber)} sub="quinzenas sem data pgto." />
+        <Kpi icon={Trash2} tone="rose" label="Estornos" value={fmtInt(estornosQtd)} sub={fmtBRL(model.estTotal)} />
+      </div>
+
+      {/* Linha 3 — Qualidade / risco */}
+      <div className="mt-3 grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <Kpi icon={XCircle} tone="rose" label="Recusadas auditoria" value={fmtInt(f.recusadas)} sub={`${fmtPct(1 - taxaAprov)} de perda na etapa 2`} />
         <Kpi icon={AlertTriangle} tone="amber" label="A verificar" value={fmtInt(f.verificar + f.pendente)} sub={`${fmtInt(f.pendente)} sem auditoria`} />
-        <Kpi icon={Clock} tone="sky" label="Em trânsito (aprovadas s/ crédito)" value={fmtInt(f.emTransito)} />
-        <Kpi icon={Trash2} tone="rose" label="Estornos" value={fmtInt(model.carteira.reduce((s, q) => s + q.estornos, 0))} sub={fmtBRL(model.estTotal)} />
+        <Kpi icon={CreditCard} tone="blue" label="Conversão por safra" value={fmtPct(A.taxaConvMadura)} sub="entrada → crédito (madura)" />
+        <Kpi icon={Coins} tone="teal" label="Ticket por vida" value={fmtBRL(planoValor * comissaoPct)} sub={`${Math.round(comissaoPct * 100)}% de ${fmtBRL(planoValor)}`} />
       </div>
 
-      {/* Comissão GT por campanha + regime recorrente */}
-      <div className="mt-3 grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <Kpi icon={Coins} tone="teal" label="Comissão total creditada" value={fmtBRL(model.comissao.total)} sub={`${fmtInt(f.creditadas)} vendas creditadas`} />
-        <Kpi icon={Plus} tone="blue" label="Comissão 1ª venda" value={fmtBRL(model.comissao.primeira)} sub={`${fmtInt(model.comissao.qtdPrimeira)} primeiras`} />
-        <Kpi icon={Repeat} tone="violet" label="Comissão recorrente" value={fmtBRL(model.comissao.recorrente)} sub={`${fmtInt(model.comissao.qtdRecorrente)} recorrentes`} />
-        <Kpi icon={Wallet} tone="emerald" label="Recorrente / mês (regime)" value={fmtBRL(model.comissaoRecorrenteMes)} sub={`${Math.round(comissaoPct * 100)}% × ${fmtInt(f.creditadas)} ativos`} />
-      </div>
-
-      {/* Funil visual */}
+      {/* Evolução da carteira + retorno do banco */}
       <div className="mt-5 grid gap-4 lg:grid-cols-3">
         <div className="lg:col-span-2 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
-          <SectionTitle>Funil de conversão</SectionTitle>
-          <FunnelBars steps={[
-            { label: "Fechamentos (clientes)", value: f.clientesUnicos, tone: "bg-sky-500" },
-            { label: "Aprovadas na auditoria", value: f.aprovadas, tone: "bg-teal-500" },
-            { label: "Enviadas ao banco (aprovadas)", value: f.aprovadas, tone: "bg-violet-500" },
-            { label: "Creditadas (vidas)", value: f.creditadas, tone: "bg-emerald-500" },
-          ]} base={f.clientesUnicos} />
-          <div className="mt-4 grid grid-cols-3 gap-3 text-center">
-            <MiniStat label="Aprovação auditoria" value={fmtPct(taxaAprov)} />
-            <MiniStat label="Crédito s/ aprovadas" value={fmtPct(taxaCred)} />
-            <MiniStat label="Conversão global" value={fmtPct(taxaGlobal)} />
-          </div>
+          <SectionTitle>Evolução da carteira (repasse por quinzena)</SectionTitle>
+          <ResponsiveContainer width="100%" height={260}>
+            <BarChart data={evolCarteira}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#eef2f7" />
+              <XAxis dataKey="label" tick={{ fontSize: 9 }} angle={-30} textAnchor="end" height={56} interval={0} />
+              <YAxis tick={{ fontSize: 11 }} />
+              <Tooltip formatter={(v, n) => n === "valor" ? fmtBRL(v) : fmtInt(v)} />
+              <Bar dataKey="valor" fill={BRAND.blue} name="Repasse (R$)" radius={[3, 3, 0, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
         </div>
         <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
-          <SectionTitle>Retorno do banco</SectionTitle>
+          <SectionTitle>Retorno do banco (carteira)</SectionTitle>
           {retornoPie.length ? (
             <ResponsiveContainer width="100%" height={240}>
               <PieChart>
@@ -1639,33 +1710,36 @@ function DashboardView({ model, planoValor, comissaoPct, setConfig, temDados, go
                 <Tooltip /><Legend wrapperStyle={{ fontSize: 11 }} />
               </PieChart>
             </ResponsiveContainer>
-          ) : <p className="py-10 text-center text-sm text-slate-400">Envie o Repasse para ver os retornos.</p>}
+          ) : <p className="py-10 text-center text-sm text-slate-400">Suba as quinzenas para ver os retornos.</p>}
         </div>
       </div>
 
-      {/* Charts */}
+      {/* Vendas por mês + conversão por safra */}
       <div className="mt-4 grid gap-4 lg:grid-cols-2">
         <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
-          <SectionTitle>Fechamentos por dia</SectionTitle>
+          <SectionTitle>Vendas iBridge por mês (topo do funil)</SectionTitle>
           <ResponsiveContainer width="100%" height={240}>
-            <LineChart data={porDia}>
+            <BarChart data={vendasMesChart}>
               <CartesianGrid strokeDasharray="3 3" stroke="#eef2f7" />
-              <XAxis dataKey="dia" tick={{ fontSize: 11 }} /><YAxis tick={{ fontSize: 11 }} />
-              <Tooltip /><Line type="monotone" dataKey="fechamentos" stroke="#0284c7" strokeWidth={2} dot={false} />
-            </LineChart>
-          </ResponsiveContainer>
-        </div>
-        <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
-          <SectionTitle>Top operadores (total × aprovadas)</SectionTitle>
-          <ResponsiveContainer width="100%" height={240}>
-            <BarChart data={porOperador}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#eef2f7" />
-              <XAxis dataKey="operador" tick={{ fontSize: 10 }} interval={0} angle={-20} textAnchor="end" height={60} />
-              <YAxis tick={{ fontSize: 11 }} /><Tooltip /><Legend wrapperStyle={{ fontSize: 11 }} />
-              <Bar dataKey="total" fill="#cbd5e1" name="Total" radius={[3, 3, 0, 0]} />
-              <Bar dataKey="aprovadas" fill="#0f766e" name="Aprovadas" radius={[3, 3, 0, 0]} />
+              <XAxis dataKey="label" tick={{ fontSize: 11 }} /><YAxis tick={{ fontSize: 11 }} />
+              <Tooltip formatter={(v) => fmtInt(v)} />
+              <Bar dataKey="vendas" fill={BRAND.teal} name="Vendas" radius={[3, 3, 0, 0]} />
             </BarChart>
           </ResponsiveContainer>
+          <p className="mt-2 text-xs text-slate-400">Volume de entrada na etapa 1 — base da projeção.</p>
+        </div>
+        <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+          <SectionTitle>Conversão por safra (entrada → crédito)</SectionTitle>
+          <ResponsiveContainer width="100%" height={240}>
+            <BarChart data={safrasChart}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#eef2f7" />
+              <XAxis dataKey="label" tick={{ fontSize: 11 }} /><YAxis tick={{ fontSize: 11 }} />
+              <Tooltip /><Legend wrapperStyle={{ fontSize: 11 }} />
+              <Bar dataKey="entradas" fill="#cbd5e1" name="Entradas" radius={[3, 3, 0, 0]} />
+              <Bar dataKey="creditaram" fill={BRAND.blue} name="Creditaram" radius={[3, 3, 0, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+          <p className="mt-2 text-xs text-slate-400">Safras recentes ainda estão maturando (crédito leva ~2 quinzenas).</p>
         </div>
       </div>
     </>
@@ -1815,6 +1889,8 @@ function FunilPanel({ model }) {
 
 /* ---------- Vendas iBridge ---------- */
 function IbridgeView({ model, ibridge, onUpload, onClear, loading }) {
+  const ops = model.analytics.porOperador;
+  const maxV = ops.length ? ops[0].vendas : 1;
   return (
     <>
       <PageHeader title="Vendas iBridge" desc="Etapa 1 do funil — fechamentos do call center. Os uploads se acumulam (sem duplicar) e você filtra por período." />
@@ -1824,7 +1900,45 @@ function IbridgeView({ model, ibridge, onUpload, onClear, loading }) {
       </div>
       {ibridge.length === 0
         ? <EmptyState icon={Phone} title="Nenhuma venda iBridge importada" desc="Envie a planilha de fechamentos do dia ou do período para iniciar o funil. Os próximos uploads serão somados a este." />
-        : <FunilPanel model={model} />}
+        : (
+          <>
+            {ops.length > 0 && (
+              <div className="mb-4 overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
+                <div className="flex items-center justify-between border-b border-slate-100 px-4 py-2.5">
+                  <span className="text-sm font-semibold text-slate-700">Desempenho por operador <span className="text-xs font-normal text-slate-400">(abr/26+)</span></span>
+                  <span className="text-xs text-slate-400">{fmtInt(ops.length)} operadores</span>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead><tr className="border-b border-slate-100 bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+                      <th className="px-4 py-2.5">Operador</th><th className="px-4 py-2.5">Vendas</th><th className="px-4 py-2.5">Aprovadas</th><th className="px-4 py-2.5">Recusadas</th><th className="px-4 py-2.5">Taxa aprov.</th><th className="px-4 py-2.5">Creditadas</th>
+                    </tr></thead>
+                    <tbody>
+                      {ops.slice(0, 15).map((o, i) => (
+                        <tr key={i} className="border-b border-slate-50 last:border-0">
+                          <td className="px-4 py-2.5 font-medium text-slate-800">{o.operador}</td>
+                          <td className="px-4 py-2.5">
+                            <div className="flex items-center gap-2">
+                              <div className="h-1.5 w-16 overflow-hidden rounded-full bg-slate-100"><div className="h-full rounded-full" style={{ width: `${(o.vendas / maxV) * 100}%`, background: BRAND.blue }} /></div>
+                              {fmtInt(o.vendas)}
+                            </div>
+                          </td>
+                          <td className="px-4 py-2.5 text-emerald-700">{fmtInt(o.aprovadas)}</td>
+                          <td className="px-4 py-2.5 text-rose-600">{fmtInt(o.recusadas)}</td>
+                          <td className="px-4 py-2.5">
+                            <span className="rounded-full px-2 py-0.5 text-xs font-medium" style={{ background: o.taxaAprov >= 0.7 ? "#dcfce7" : o.taxaAprov >= 0.5 ? "#fef9c3" : "#fee2e2", color: o.taxaAprov >= 0.7 ? "#15803d" : o.taxaAprov >= 0.5 ? "#a16207" : "#b91c1c" }}>{fmtPct(o.taxaAprov)}</span>
+                          </td>
+                          <td className="px-4 py-2.5 font-medium" style={{ color: BRAND.blueDeep }}>{fmtInt(o.creditadas)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+            <FunilPanel model={model} />
+          </>
+        )}
     </>
   );
 }
@@ -2104,71 +2218,164 @@ function proximasQuinzenas(ultimaFimISO, n) {
   return out;
 }
 
-function ProjecaoView({ model, planoValor, comissaoPct, campanhas }) {
-  const cart = model.carteira; // quinzenas históricas (cronológico)
-  const N_FUT = 4;
+function ProjecaoView({ model, planoValor, comissaoPct, campanhas, metaMensal, setConfig }) {
+  const A = model.analytics;
+  const cart = model.carteira;
+  const N_FUT = 6; // 6 quinzenas (3 meses) para enxergar a campanha maturar
+  const [cenario, setCenario] = useState("realista");
+  const [meta, setMeta] = useState(metaMensal || 1400);
+  const [comCampanha, setComCampanha] = useState(true);
+
+  const TAXAS = { conservador: 0.27, realista: 0.32, otimista: 0.38 };
+
+  // Curva de maturação normalizada (fração do total de conversão em cada +k quinzenas)
+  const curva = useMemo(() => {
+    const c = A.curvaMaturacao && Object.keys(A.curvaMaturacao).length ? A.curvaMaturacao : { 1: 0.008, 2: 0.132, 3: 0.123, 4: 0.010 };
+    const tot = Object.values(c).reduce((a, b) => a + b, 0) || 1;
+    const norm = {}; for (const k in c) norm[k] = c[k] / tot;
+    return norm; // soma 1
+  }, [A]);
 
   const proj = useMemo(() => {
     if (!cart.length) return null;
-    const ult = cart.slice(-Math.min(4, cart.length)); // últimas até 4 quinzenas
-    const mediaNovas = Math.round(ult.reduce((s, q) => s + q.novas, 0) / ult.length);
+    const conv = TAXAS[cenario];
     const ultima = cart[cart.length - 1];
-    let baseRecorrente = model.clientesCreditados; // carteira ativa atual (CPFs já creditados)
-    const recorrenteUnit = planoValor * comissaoPct;             // 30%
     const futuras = proximasQuinzenas(ultima.periodoFim || ultima.periodoIni, N_FUT);
+    const qIdx = A.qIdx;
+    const primeiroFi = A.qIdx(futuras[0].fim);
+
+    // Safras de venda: histórico recente ainda maturando + futuras pela meta
+    const cohorts = [];
+    // recentes já vendidas (últimos 2 meses do iBridge) — maturação restante
+    for (const vm of A.vendasPorMes.slice(-2)) cohorts.push({ mes: vm.mes, vendas: vm.qtd });
+    // futuras: do próximo mês em diante (4 meses), volume = meta
+    let [y, m] = (A.vendasPorMes[A.vendasPorMes.length - 1]?.mes || mesAtualISO()).split("-").map(Number);
+    for (let i = 0; i < 4; i++) { m += 1; if (m > 12) { m = 1; y += 1; } cohorts.push({ mes: `${y}-${String(m).padStart(2, "0")}`, vendas: meta, futura: true }); }
+
+    let baseAtiva = model.clientesCreditados;
+    // taxa de recorrência por quinzena (recorrentes recentes / base ativa)
+    const recRecorr = cart.slice(-4).reduce((s, q) => s + q.recorrentes, 0) / Math.min(4, cart.length);
+    const recRate = baseAtiva ? Math.min(0.6, recRecorr / baseAtiva) : 0.2;
+    const recorrUnit = planoValor * comissaoPct; // 30%
+
     const linhas = futuras.map((q) => {
-      const camp = campanhaDaData(campanhas, q.fim);
-      const novaUnit = planoValor * (camp ? camp.pctPrimeira : comissaoPct);
-      const valRec = baseRecorrente * recorrenteUnit;
-      const valNova = mediaNovas * novaUnit;
-      const total = valRec + valNova;
-      const linha = { ...q, recorrentes: baseRecorrente, novas: mediaNovas, valRec, valNova, total, campanha: camp?.nome || null };
-      baseRecorrente += mediaNovas; // novas entram na carteira recorrente nas próximas quinzenas
-      return linha;
+      const fi = qIdx(q.fim);
+      // novas creditadas nesta quinzena, somando todas as safras
+      let novasCamp = 0, novas30 = 0;
+      for (const co of cohorts) {
+        const anchor = qIdx(co.mes + "-16"); // entrada concentrada na 2ª metade
+        const k = fi - anchor;
+        const frac = curva[k] || 0;
+        if (frac <= 0) continue;
+        const creditos = co.vendas * conv * frac;
+        // campanha: venda (entrada) entre 01/06 e 31/12/2026 -> 1ª venda paga 50%
+        const dentroCamp = comCampanha && campanhaDaData(campanhas, co.mes + "-16");
+        if (dentroCamp) novasCamp += creditos; else novas30 += creditos;
+      }
+      const novas = novasCamp + novas30;
+      const recorrentes = Math.round(baseAtiva * recRate);
+      const valNovas = novasCamp * planoValor * 0.50 + novas30 * planoValor * comissaoPct;
+      const valNovas30 = novas * planoValor * comissaoPct; // cenário sem campanha
+      const valRec = recorrentes * recorrUnit;
+      const total = valNovas + valRec;
+      const totalSemCamp = valNovas30 + valRec;
+      baseAtiva += Math.round(novas); // novas entram na carteira recorrente
+      return { ...q, novas: Math.round(novas), novasCamp: Math.round(novasCamp), recorrentes, valNovas, valRec, total, totalSemCamp };
     });
     const totalProj = linhas.reduce((s, l) => s + l.total, 0);
-    return { mediaNovas, recorrenteUnit, linhas, totalProj, baseInicial: model.clientesCreditados };
-  }, [cart, model, planoValor, comissaoPct, campanhas]);
+    const totalSemCamp = linhas.reduce((s, l) => s + l.totalSemCamp, 0);
+    return { linhas, totalProj, totalSemCamp, recRate, conv, baseInicial: model.clientesCreditados };
+  }, [cart, model, planoValor, comissaoPct, campanhas, cenario, meta, comCampanha, curva, A]);
 
   const chartData = useMemo(() => {
-    const hist = cart.map((q) => ({ label: labelMes(mesDeISO(q.periodoFim || q.periodoIni)), tipo: "Realizado", valor: q.valorCreditado }));
-    const fut = proj ? proj.linhas.map((l) => ({ label: labelMes(mesDeISO(l.fim)) + (l.fim.endsWith("15") ? " Q1" : " Q2"), tipo: "Projetado", valor: l.total })) : [];
+    if (!proj) return [];
+    const hist = cart.map((q) => ({ label: labelMes(mesDeISO(q.periodoFim || q.periodoIni)) + (String(q.periodoFim).endsWith("15") ? " Q1" : " Q2"), tipo: "Realizado", valor: q.valorCreditado }));
+    const fut = proj.linhas.map((l) => ({ label: labelMes(mesDeISO(l.fim)) + (String(l.fim).endsWith("15") ? " Q1" : " Q2"), tipo: "Projetado", valor: comCampanha ? l.total : l.totalSemCamp }));
     return [...hist, ...fut];
-  }, [cart, proj]);
+  }, [cart, proj, comCampanha]);
+
+  const salvarMeta = () => setConfig({ metaMensal: meta });
+
+  const btnCen = (id, label, sub) => (
+    <button onClick={() => setCenario(id)} className="flex-1 rounded-lg border px-3 py-2 text-left transition"
+      style={cenario === id ? { borderColor: BRAND.blue, background: "#EAF3FA" } : { borderColor: "#e2e8f0", background: "#fff" }}>
+      <div className="text-xs font-semibold" style={{ color: cenario === id ? BRAND.blueDeep : "#475569" }}>{label}</div>
+      <div className="text-[11px] text-slate-400">{sub}</div>
+    </button>
+  );
 
   return (
     <>
-      <PageHeader title="Projeção" desc="Projeção dos próximos repasses (pagamentos dia 15 e 25): carteira recorrente fixa + novas entradas pela média das últimas quinzenas." />
+      <PageHeader title="Projeção" desc="Modelo por safra: vendas do iBridge → aprovação na auditoria → crédito com defasagem real (~2 quinzenas). Pagamentos nos dias 15 e 25." />
 
       {!cart.length ? (
         <EmptyState icon={TrendingUp} title="Sem dados de crédito ainda" desc="Suba as quinzenas no menu Vendas Creditadas para projetar os próximos repasses." />
       ) : (
         <>
-          <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-            <Kpi icon={Users} tone="blue" label="Carteira recorrente atual" value={fmtInt(proj.baseInicial)} sub="CPFs já creditados" />
-            <Kpi icon={Plus} tone="violet" label="Novas / quinzena (média)" value={fmtInt(proj.mediaNovas)} sub="últimas quinzenas" />
-            <Kpi icon={Coins} tone="teal" label="Repasse recorrente / cliente" value={fmtBRL(proj.recorrenteUnit)} sub={`${Math.round(comissaoPct * 100)}% de ${fmtBRL(planoValor)}`} />
-            <Kpi icon={Wallet} tone="emerald" label={`Projeção ${N_FUT} quinzenas`} value={fmtBRL(proj.totalProj)} />
+          {/* Premissas medidas dos dados */}
+          <div className="mb-4 grid grid-cols-2 gap-3 lg:grid-cols-4">
+            <Kpi icon={ShieldCheck} tone="emerald" label="Taxa de aprovação" value={fmtPct(A.taxaAprovacao)} sub="auditoria (real)" />
+            <Kpi icon={Repeat} tone="violet" label="Retenção da carteira" value={fmtPct(A.retencaoMedia)} sub="recorrência por quinzena" />
+            <Kpi icon={Clock} tone="sky" label="Defasagem venda→crédito" value="~2 quinzenas" sub="mediana 39 dias" />
+            <Kpi icon={Users} tone="blue" label="Carteira recorrente" value={fmtInt(model.clientesCreditados)} sub="CPFs ativos hoje" />
           </div>
 
-          <div className="mt-5 overflow-hidden rounded-xl border border-slate-200 bg-white">
+          {/* Controles */}
+          <div className="mb-4 rounded-xl border border-slate-200 bg-white p-4">
+            <div className="grid gap-4 lg:grid-cols-[1fr_auto_auto]">
+              <div>
+                <label className="mb-1.5 block text-xs font-medium text-slate-600">Cenário de conversão (entrada → crédito)</label>
+                <div className="flex gap-2">
+                  {btnCen("conservador", "Conservador", "27% da safra")}
+                  {btnCen("realista", "Realista", "32% da safra")}
+                  {btnCen("otimista", "Otimista", "38% da safra")}
+                </div>
+              </div>
+              <div>
+                <label className="mb-1.5 block text-xs font-medium text-slate-600">Meta de vendas/mês (iBridge)</label>
+                <div className="flex items-center gap-2">
+                  <input type="number" step="50" value={meta} onChange={(e) => setMeta(parseInt(e.target.value) || 0)}
+                    className="w-28 rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-400" />
+                  <button onClick={salvarMeta} className="rounded-lg px-3 py-2 text-xs font-semibold text-white" style={{ background: BRAND.blue }}>Salvar</button>
+                </div>
+                <div className="mt-1 text-[11px] text-slate-400">Tendência: {A.vendasPorMes.map((v) => v.qtd).join(" → ")}</div>
+              </div>
+              <div>
+                <label className="mb-1.5 block text-xs font-medium text-slate-600">Campanha 50%</label>
+                <button onClick={() => setComCampanha((s) => !s)}
+                  className="flex items-center gap-2 rounded-lg border px-3 py-2 text-xs font-medium"
+                  style={comCampanha ? { borderColor: BRAND.teal, background: "#E6F6F6", color: "#2C8E8E" } : { borderColor: "#e2e8f0", color: "#64748b" }}>
+                  <Megaphone size={14} /> {comCampanha ? "Aplicada (jun–dez)" : "Desligada"}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* Resultado */}
+          <div className="mb-4 grid grid-cols-2 gap-3 lg:grid-cols-3">
+            <Kpi icon={Wallet} tone="emerald" label={`Projeção ${N_FUT} quinzenas`} value={fmtBRL(comCampanha ? proj.totalProj : proj.totalSemCamp)} sub={comCampanha ? "com campanha 50%" : "30% liso"} />
+            <Kpi icon={Megaphone} tone="teal" label="Ganho da campanha" value={fmtBRL(proj.totalProj - proj.totalSemCamp)} sub="extra dos 50% nas safras jun+" />
+            <Kpi icon={TrendingUp} tone="blue" label="Média por quinzena" value={fmtBRL((comCampanha ? proj.totalProj : proj.totalSemCamp) / N_FUT)} />
+          </div>
+
+          <div className="overflow-hidden rounded-xl border border-slate-200 bg-white">
             <div className="border-b border-slate-100 px-4 py-2.5 text-sm font-semibold text-slate-700">Próximos repasses projetados</div>
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead><tr className="border-b border-slate-100 bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
-                  <th className="px-4 py-2.5">Quinzena</th><th className="px-4 py-2.5">Pagamento</th><th className="px-4 py-2.5">Recorrentes</th><th className="px-4 py-2.5">Novas</th>
-                  <th className="px-4 py-2.5">Recorrente (R$)</th><th className="px-4 py-2.5">Novas (R$)</th><th className="px-4 py-2.5">Total quinzena</th>
+                  <th className="px-4 py-2.5">Quinzena (venda)</th><th className="px-4 py-2.5">Pagamento</th><th className="px-4 py-2.5">Novas créd.</th><th className="px-4 py-2.5">Recorrentes</th>
+                  <th className="px-4 py-2.5">Novas (R$)</th><th className="px-4 py-2.5">Recorrente (R$)</th><th className="px-4 py-2.5">Total</th>
                 </tr></thead>
                 <tbody>
                   {proj.linhas.map((l, i) => (
                     <tr key={i} className="border-b border-slate-50 last:border-0">
-                      <td className="px-4 py-2.5 font-medium text-slate-800">{l.label}{l.campanha && <span className="ml-1 rounded-full bg-emerald-50 px-1.5 py-0.5 text-[10px] text-emerald-700">campanha</span>}</td>
+                      <td className="px-4 py-2.5 font-medium text-slate-800">{l.label}{l.novasCamp > 0 && comCampanha && <span className="ml-1 rounded-full bg-emerald-50 px-1.5 py-0.5 text-[10px] text-emerald-700">{fmtInt(l.novasCamp)} a 50%</span>}</td>
                       <td className="px-4 py-2.5 text-slate-600">{brFromISO(l.pagamento)}</td>
-                      <td className="px-4 py-2.5">{fmtInt(l.recorrentes)}</td>
                       <td className="px-4 py-2.5">{fmtInt(l.novas)}</td>
+                      <td className="px-4 py-2.5">{fmtInt(l.recorrentes)}</td>
+                      <td className="px-4 py-2.5 text-slate-600">{fmtBRL(comCampanha ? l.valNovas : l.novas * planoValor * comissaoPct)}</td>
                       <td className="px-4 py-2.5 text-slate-600">{fmtBRL(l.valRec)}</td>
-                      <td className="px-4 py-2.5 text-slate-600">{fmtBRL(l.valNova)}</td>
-                      <td className="px-4 py-2.5 font-semibold text-emerald-700">{fmtBRL(l.total)}</td>
+                      <td className="px-4 py-2.5 font-semibold text-emerald-700">{fmtBRL(comCampanha ? l.total : l.totalSemCamp)}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -2181,7 +2388,7 @@ function ProjecaoView({ model, planoValor, comissaoPct, campanhas }) {
             <ResponsiveContainer width="100%" height={300}>
               <BarChart data={chartData}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#eef2f7" />
-                <XAxis dataKey="label" tick={{ fontSize: 10 }} angle={-25} textAnchor="end" height={60} />
+                <XAxis dataKey="label" tick={{ fontSize: 9 }} angle={-35} textAnchor="end" height={64} interval={0} />
                 <YAxis tick={{ fontSize: 11 }} />
                 <Tooltip formatter={(v) => fmtBRL(v)} />
                 <Bar dataKey="valor" radius={[3, 3, 0, 0]} name="Repasse">
@@ -2189,7 +2396,10 @@ function ProjecaoView({ model, planoValor, comissaoPct, campanhas }) {
                 </Bar>
               </BarChart>
             </ResponsiveContainer>
-            <p className="mt-2 text-xs text-slate-400">Azul = realizado (planilhas do parceiro) · Verde-água = projetado. Premissa: recorrência a {Math.round(comissaoPct * 100)}% e novas a {fmtInt(proj.mediaNovas)}/quinzena (1ª venda a 50% quando há campanha vigente).</p>
+            <p className="mt-2 text-xs text-slate-400">
+              Azul = realizado (planilhas do parceiro) · Verde-água = projetado. Motor: cada safra de venda credita ~{fmtPct(proj.conv)} ao longo de 2–3 quinzenas;
+              carteira recorrente renova {fmtPct(proj.recRate)}/quinzena; valor por vida = {fmtBRL(planoValor * comissaoPct)} (recorrência) e {fmtBRL(planoValor * 0.5)} (1ª venda na campanha).
+            </p>
           </div>
         </>
       )}
