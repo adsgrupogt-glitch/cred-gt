@@ -1785,9 +1785,10 @@ function RecBadge({ tipo }) {
   </span>;
 }
 
-function FunilPanel({ model }) {
+function FunilPanel({ model, showRanking = false }) {
   // Filtro de período: mês atual / mês específico / intervalo / todas
-  const [periodo, setPeriodo] = useState("todas");
+  // Padrão ao logar: Mês atual (em iBridge, Auditadas e Creditadas).
+  const [periodo, setPeriodo] = useState("atual");
   const [mesSel, setMesSel] = useState(mesAtualISO());
   const [de, setDe] = useState(""); const [ate, setAte] = useState("");
 
@@ -1807,6 +1808,23 @@ function FunilPanel({ model }) {
 
   const rows = useMemo(() => model.enriched.filter(noPeriodo), [model, periodo, mesSel, de, ate]);
   const operadores = [...new Set(rows.map((v) => v.operador).filter(Boolean))].sort();
+
+  // Desempenho por operador no MESMO recorte de período (taxa = aprovadas / vendas)
+  const opsRank = useMemo(() => {
+    const map = new Map();
+    for (const r of rows) {
+      if (!r.operador) continue;
+      const o = map.get(r.operador) || { operador: r.operador, vendas: 0, aprovadas: 0, recusadas: 0, creditadas: 0 };
+      o.vendas++;
+      if (r.statusAud === "APROVADA") o.aprovadas++;
+      else if (r.statusAud === "RECUSADA") o.recusadas++;
+      if (r.statusCred === "CREDITADO") o.creditadas++;
+      map.set(r.operador, o);
+    }
+    return [...map.values()].map((o) => ({ ...o, taxaAprov: o.vendas ? o.aprovadas / o.vendas : 0 })).sort((a, b) => b.vendas - a.vendas);
+  }, [rows]);
+  const maxVOp = opsRank.length ? opsRank[0].vendas : 1;
+  const periodoLabel = periodo === "atual" ? "mês atual" : periodo === "mes" ? labelMes(mesSel) : periodo === "intervalo" ? "intervalo" : "todas as vendas";
 
   const k = useMemo(() => {
     const cpfs = new Set(rows.map((r) => r.cpf).filter(Boolean));
@@ -1851,6 +1869,42 @@ function FunilPanel({ model }) {
         <span className="ml-auto text-xs text-slate-400">{fmtInt(k.fechamentos)} fechamentos no recorte</span>
       </div>
 
+      {/* Desempenho por operador (segue o período selecionado acima) */}
+      {showRanking && opsRank.length > 0 && (
+        <div className="mb-4 overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
+          <div className="flex items-center justify-between border-b border-slate-100 px-4 py-2.5">
+            <span className="text-sm font-semibold text-slate-700">Desempenho por operador <span className="text-xs font-normal text-slate-400">({periodoLabel})</span></span>
+            <span className="text-xs text-slate-400">{fmtInt(opsRank.length)} operadores</span>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead><tr className="border-b border-slate-100 bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+                <th className="px-4 py-2.5">Operador</th><th className="px-4 py-2.5">Vendas</th><th className="px-4 py-2.5">Aprovadas</th><th className="px-4 py-2.5">Recusadas</th><th className="px-4 py-2.5">Taxa aprov.</th><th className="px-4 py-2.5">Creditadas</th>
+              </tr></thead>
+              <tbody>
+                {opsRank.slice(0, 15).map((o, i) => (
+                  <tr key={i} className="border-b border-slate-50 last:border-0">
+                    <td className="px-4 py-2.5 font-medium text-slate-800">{o.operador}</td>
+                    <td className="px-4 py-2.5">
+                      <div className="flex items-center gap-2">
+                        <div className="h-1.5 w-16 overflow-hidden rounded-full bg-slate-100"><div className="h-full rounded-full" style={{ width: `${(o.vendas / maxVOp) * 100}%`, background: BRAND.blue }} /></div>
+                        {fmtInt(o.vendas)}
+                      </div>
+                    </td>
+                    <td className="px-4 py-2.5 text-emerald-700">{fmtInt(o.aprovadas)}</td>
+                    <td className="px-4 py-2.5 text-rose-600">{fmtInt(o.recusadas)}</td>
+                    <td className="px-4 py-2.5">
+                      <span className="rounded-full px-2 py-0.5 text-xs font-medium" style={{ background: o.taxaAprov >= 0.7 ? "#dcfce7" : o.taxaAprov >= 0.5 ? "#fef9c3" : "#fee2e2", color: o.taxaAprov >= 0.7 ? "#15803d" : o.taxaAprov >= 0.5 ? "#a16207" : "#b91c1c" }}>{fmtPct(o.taxaAprov)}</span>
+                    </td>
+                    <td className="px-4 py-2.5 font-medium" style={{ color: BRAND.blueDeep }}>{fmtInt(o.creditadas)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
       {/* KPIs do recorte */}
       <div className="mb-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
         <Kpi icon={Phone} tone="sky" label="Fechamentos" value={fmtInt(k.fechamentos)} sub={`${fmtInt(k.unicos)} CPFs únicos`} />
@@ -1889,8 +1943,6 @@ function FunilPanel({ model }) {
 
 /* ---------- Vendas iBridge ---------- */
 function IbridgeView({ model, ibridge, onUpload, onClear, loading }) {
-  const ops = model.analytics.porOperador;
-  const maxV = ops.length ? ops[0].vendas : 1;
   return (
     <>
       <PageHeader title="Vendas iBridge" desc="Etapa 1 do funil — fechamentos do call center. Os uploads se acumulam (sem duplicar) e você filtra por período." />
@@ -1900,45 +1952,7 @@ function IbridgeView({ model, ibridge, onUpload, onClear, loading }) {
       </div>
       {ibridge.length === 0
         ? <EmptyState icon={Phone} title="Nenhuma venda iBridge importada" desc="Envie a planilha de fechamentos do dia ou do período para iniciar o funil. Os próximos uploads serão somados a este." />
-        : (
-          <>
-            {ops.length > 0 && (
-              <div className="mb-4 overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
-                <div className="flex items-center justify-between border-b border-slate-100 px-4 py-2.5">
-                  <span className="text-sm font-semibold text-slate-700">Desempenho por operador <span className="text-xs font-normal text-slate-400">(abr/26+)</span></span>
-                  <span className="text-xs text-slate-400">{fmtInt(ops.length)} operadores</span>
-                </div>
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm">
-                    <thead><tr className="border-b border-slate-100 bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
-                      <th className="px-4 py-2.5">Operador</th><th className="px-4 py-2.5">Vendas</th><th className="px-4 py-2.5">Aprovadas</th><th className="px-4 py-2.5">Recusadas</th><th className="px-4 py-2.5">Taxa aprov.</th><th className="px-4 py-2.5">Creditadas</th>
-                    </tr></thead>
-                    <tbody>
-                      {ops.slice(0, 15).map((o, i) => (
-                        <tr key={i} className="border-b border-slate-50 last:border-0">
-                          <td className="px-4 py-2.5 font-medium text-slate-800">{o.operador}</td>
-                          <td className="px-4 py-2.5">
-                            <div className="flex items-center gap-2">
-                              <div className="h-1.5 w-16 overflow-hidden rounded-full bg-slate-100"><div className="h-full rounded-full" style={{ width: `${(o.vendas / maxV) * 100}%`, background: BRAND.blue }} /></div>
-                              {fmtInt(o.vendas)}
-                            </div>
-                          </td>
-                          <td className="px-4 py-2.5 text-emerald-700">{fmtInt(o.aprovadas)}</td>
-                          <td className="px-4 py-2.5 text-rose-600">{fmtInt(o.recusadas)}</td>
-                          <td className="px-4 py-2.5">
-                            <span className="rounded-full px-2 py-0.5 text-xs font-medium" style={{ background: o.taxaAprov >= 0.7 ? "#dcfce7" : o.taxaAprov >= 0.5 ? "#fef9c3" : "#fee2e2", color: o.taxaAprov >= 0.7 ? "#15803d" : o.taxaAprov >= 0.5 ? "#a16207" : "#b91c1c" }}>{fmtPct(o.taxaAprov)}</span>
-                          </td>
-                          <td className="px-4 py-2.5 font-medium" style={{ color: BRAND.blueDeep }}>{fmtInt(o.creditadas)}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            )}
-            <FunilPanel model={model} />
-          </>
-        )}
+        : <FunilPanel model={model} showRanking />}
     </>
   );
 }
