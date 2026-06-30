@@ -810,28 +810,41 @@ function App() {
       if (kind === "ibridge") {
         const novos = parseIbridge(wb);
         if (!novos.length) throw new Error("Nenhuma venda encontrada. Confira se a planilha tem a coluna 'Código' e 'Contato'.");
-        // Acumula com as vendas já existentes, sem duplicar (chave = CPF|data|hora)
-        let acumulado, addNovos = 0;
-        setIbridge((prev) => {
-          const mapa = new Map(prev.map((r) => [r.uid || uidIb(r), r]));
-          const antes = mapa.size;
-          for (const r of novos) mapa.set(r.uid || uidIb(r), r);
-          acumulado = [...mapa.values()].sort((a, b) => (b.dataISO || "").localeCompare(a.dataISO || ""));
-          addNovos = mapa.size - antes;
-          return acumulado;
-        });
-        await store.set(STORAGE_KEYS.ibridge, acumulado);
+        // Acumula com o que já está salvo, sem duplicar (chave = CPF|data|hora).
+        // Lê a base persistida para garantir o acúmulo mesmo após recarregar a página.
+        const salvo = (await store.get(STORAGE_KEYS.ibridge)) || ibridge || [];
+        const mapa = new Map(salvo.map((r) => [r.uid || uidIb(r), r]));
+        const antes = mapa.size;
+        for (const r of novos) mapa.set(r.uid || uidIb(r), r);
+        const acumulado = [...mapa.values()].sort((a, b) => (b.dataISO || "").localeCompare(a.dataISO || ""));
+        const addNovos = mapa.size - antes;
+        await store.set(STORAGE_KEYS.ibridge, acumulado);  // grava ANTES (sem corrida)
+        setIbridge(acumulado);
         flash(`iBridge acumulado: +${fmtInt(addNovos)} novos fechamentos (${fmtInt(acumulado.length)} no total).`);
       } else if (kind === "auditoria") {
-        const data = parseAuditoria(wb);
-        if (!data.length) throw new Error("Nenhum registro de auditoria encontrado. Confira as colunas CPF / ELEGÍVEL.");
-        setAuditoria(data); await store.set(STORAGE_KEYS.auditoria, data);
-        flash(`Auditoria atualizada: ${fmtInt(data.length)} registros importados.`);
+        const novos = parseAuditoria(wb);
+        if (!novos.length) throw new Error("Nenhum registro de auditoria encontrado. Confira as colunas CPF / ELEGÍVEL.");
+        // Auditoria também acumula e não duplica (chave = CPF; mantém a melhor classificação)
+        const salvo = (await store.get(STORAGE_KEYS.auditoria)) || auditoria || [];
+        const prioAud = { APROVADA: 3, RECUSADA: 2, VERIFICAR: 1 };
+        const mapa = new Map();
+        for (const a of salvo) if (a.cpf) mapa.set(a.cpf, a);
+        let add = 0;
+        for (const a of novos) {
+          if (!a.cpf) continue;
+          const cur = mapa.get(a.cpf);
+          if (!cur) { mapa.set(a.cpf, a); add++; }
+          else if ((prioAud[a.status] || 0) >= (prioAud[cur.status] || 0)) mapa.set(a.cpf, a); // atualiza
+        }
+        const acumulado = [...mapa.values()];
+        await store.set(STORAGE_KEYS.auditoria, acumulado);
+        setAuditoria(acumulado);
+        flash(`Auditoria acumulada: +${fmtInt(add)} novos CPFs (${fmtInt(acumulado.length)} no total).`);
       }
     } catch (e) {
       flash(e.message || "Falha ao processar a planilha.", false);
     } finally { setLoading(""); }
-  }, []);
+  }, [ibridge, auditoria]);
 
   // Lê o arquivo de uma quinzena e devolve {parsed, meta} para o formulário (sem persistir)
   const lerQuinzena = useCallback(async (file) => {
