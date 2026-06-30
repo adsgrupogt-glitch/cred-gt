@@ -2246,16 +2246,18 @@ function ProjecaoView({ model, planoValor, comissaoPct, campanhas, metaMensal, s
 
     // Safras de venda: histórico recente ainda maturando + futuras pela meta
     const cohorts = [];
-    // recentes já vendidas (últimos 2 meses do iBridge) — maturação restante
-    for (const vm of A.vendasPorMes.slice(-2)) cohorts.push({ mes: vm.mes, vendas: vm.qtd });
+    // recentes já vendidas (últimos 3 meses do iBridge) — maturação restante
+    for (const vm of A.vendasPorMes.slice(-3)) cohorts.push({ mes: vm.mes, vendas: vm.qtd });
     // futuras: do próximo mês em diante (4 meses), volume = meta
     let [y, m] = (A.vendasPorMes[A.vendasPorMes.length - 1]?.mes || mesAtualISO()).split("-").map(Number);
     for (let i = 0; i < 4; i++) { m += 1; if (m > 12) { m = 1; y += 1; } cohorts.push({ mes: `${y}-${String(m).padStart(2, "0")}`, vendas: meta, futura: true }); }
 
     let baseAtiva = model.clientesCreditados;
-    // taxa de recorrência por quinzena (recorrentes recentes / base ativa)
-    const recRecorr = cart.slice(-4).reduce((s, q) => s + q.recorrentes, 0) / Math.min(4, cart.length);
-    const recRate = baseAtiva ? Math.min(0.6, recRecorr / baseAtiva) : 0.2;
+    // ÂNCORA: a recorrência parte do nível REAL da última quinzena (não recria de uma base pequena).
+    // pRebill = recorrentes reais da última quinzena ÷ carteira ativa → a 1ª projetada bate com o realizado.
+    const ultima2 = cart[cart.length - 1] || { recorrentes: 0 };
+    const pRebill = baseAtiva ? Math.min(0.6, Math.max(0.05, ultima2.recorrentes / baseAtiva)) : 0.2;
+    const retencaoNovas = 0.85; // % das novas creditadas que seguem ativas (engrossam a recorrência)
     const recorrUnit = planoValor * comissaoPct; // 30%
 
     const linhas = futuras.map((q) => {
@@ -2273,18 +2275,18 @@ function ProjecaoView({ model, planoValor, comissaoPct, campanhas, metaMensal, s
         if (dentroCamp) novasCamp += creditos; else novas30 += creditos;
       }
       const novas = novasCamp + novas30;
-      const recorrentes = Math.round(baseAtiva * recRate);
+      const recorrentes = Math.round(baseAtiva * pRebill);
       const valNovas = novasCamp * planoValor * 0.50 + novas30 * planoValor * comissaoPct;
       const valNovas30 = novas * planoValor * comissaoPct; // cenário sem campanha
       const valRec = recorrentes * recorrUnit;
       const total = valNovas + valRec;
       const totalSemCamp = valNovas30 + valRec;
-      baseAtiva += Math.round(novas); // novas entram na carteira recorrente
+      baseAtiva += Math.round(novas * retencaoNovas); // novas creditadas engrossam a carteira viva
       return { ...q, novas: Math.round(novas), novasCamp: Math.round(novasCamp), recorrentes, valNovas, valRec, total, totalSemCamp };
     });
     const totalProj = linhas.reduce((s, l) => s + l.total, 0);
     const totalSemCamp = linhas.reduce((s, l) => s + l.totalSemCamp, 0);
-    return { linhas, totalProj, totalSemCamp, recRate, conv, baseInicial: model.clientesCreditados };
+    return { linhas, totalProj, totalSemCamp, recRate: pRebill, conv, baseInicial: model.clientesCreditados };
   }, [cart, model, planoValor, comissaoPct, campanhas, cenario, meta, comCampanha, curva, A]);
 
   const chartData = useMemo(() => {
