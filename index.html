@@ -1,0 +1,2261 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<title>Cred GT · Gestão de Vendas</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Cpolygon points='50,8 88,30 50,52 12,30' fill='%233585BC'/%3E%3Cpolygon points='12,30 50,52 50,78 12,56' fill='%235CBFBF'/%3E%3C/svg%3E" />
+
+<!-- Tailwind (mesmas classes utilitárias usadas no app) -->
+<script src="https://cdn.tailwindcss.com"></script>
+
+<!-- Firebase (compat 10.12.2): app + realtime database -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+
+<style>
+  html,body,#root{height:100%}
+  body{margin:0;background:#f1f5f9;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif}
+  #boot{position:fixed;inset:0;display:grid;place-items:center;color:#64748b;font-size:14px}
+</style>
+</head>
+<body>
+<div id="root"><div id="boot">Carregando Cred GT…</div></div>
+
+<!-- ============ PASSO 1 — CONFIGURAÇÃO DO FIREBASE ============
+     Crie um projeto novo no Firebase (Realtime Database) e cole aqui os valores.
+     A apiKey do Firebase Web é pública por design — pode colar sem medo.        -->
+<script>
+  window.FIREBASE_CONFIG = {
+    apiKey:            "AIzaSyCfBQgPgRyNqkLhtJz0Ex-zl2pKU4C_xlA",
+    authDomain:        "cred-gt.firebaseapp.com",
+    databaseURL:       "https://cred-gt-default-rtdb.firebaseio.com",
+    projectId:         "cred-gt",
+    storageBucket:     "cred-gt.firebasestorage.app",
+    messagingSenderId: "801200592279",
+    appId:             "1:801200592279:web:65e2a7b1cba8b00cb560d2"
+  };
+</script>
+
+<!-- ============ Shim window.storage -> Firebase (compartilhado) / localStorage (sessão) ============ -->
+<script>
+(function () {
+  try { firebase.initializeApp(window.FIREBASE_CONFIG); }
+  catch (e) { console.error("Falha ao iniciar Firebase — confira FIREBASE_CONFIG.", e); }
+  var db = null;
+  try { db = firebase.database(); } catch (e) { console.error("Realtime Database indisponível.", e); }
+
+  // Só a sessão fica local por dispositivo; o resto é base única compartilhada.
+  var LOCAIS = { "credgt:session": true };
+  var sani = function (k) { return String(k).replace(/[.#$\[\]/:]/g, "_"); };
+
+  window.storage = {
+    get: function (key) {
+      if (LOCAIS[key]) {
+        try { var v = localStorage.getItem(key); return Promise.resolve(v != null ? { value: v } : null); }
+        catch (e) { return Promise.resolve(null); }
+      }
+      if (!db) return Promise.resolve(null);
+      return db.ref("credgt/" + sani(key)).once("value").then(function (snap) {
+        var v = snap.exists() ? snap.val() : null;
+        return v != null ? { value: v } : null;
+      }).catch(function () { return null; });
+    },
+    set: function (key, value) {
+      if (LOCAIS[key]) {
+        try { localStorage.setItem(key, value); } catch (e) {}
+        return Promise.resolve();
+      }
+      if (!db) return Promise.resolve();
+      return db.ref("credgt/" + sani(key)).set(value).catch(function (e) { console.warn("storage.set", e); });
+    },
+    delete: function (key) {
+      if (LOCAIS[key]) { try { localStorage.removeItem(key); } catch (e) {} return Promise.resolve(); }
+      if (!db) return Promise.resolve();
+      return db.ref("credgt/" + sani(key)).remove().catch(function () {});
+    }
+  };
+})();
+</script>
+
+<!-- ============ Dependências ESM (importmap) ============ -->
+<script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@18.3.1",
+    "react-dom": "https://esm.sh/react-dom@18.3.1",
+    "react-dom/client": "https://esm.sh/react-dom@18.3.1/client",
+    "react/jsx-runtime": "https://esm.sh/react@18.3.1/jsx-runtime",
+    "recharts": "https://esm.sh/recharts@2.12.7?deps=react@18.3.1,react-dom@18.3.1",
+    "lucide-react": "https://esm.sh/lucide-react@0.383.0?deps=react@18.3.1",
+    "xlsx": "https://esm.sh/xlsx@0.18.5"
+  }
+}
+</script>
+
+<!-- Babel standalone transpila o JSX no navegador -->
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+
+<!-- ============ Aplicação ============ -->
+<script type="text/babel" data-type="module" data-presets="react">
+import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
+import * as XLSX from "xlsx";
+import {
+  BarChart, Bar, LineChart, Line, PieChart, Pie, Cell,
+  XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
+} from "recharts";
+import {
+  LayoutDashboard, Phone, ShieldCheck, CreditCard, TrendingUp, FileText,
+  Upload, Search, RefreshCw, Trash2, Download, AlertTriangle, CheckCircle2,
+  XCircle, Clock, Users, Wallet, Filter, ChevronLeft, ChevronRight, Database,
+  LogOut, Lock, KeyRound, Plus, Pencil, Check, X, Calendar, Repeat, Coins, UserCog, Megaphone,
+} from "lucide-react";
+
+/* ============================================================
+   CRED GT · Sistema de Gestão e Controle de Vendas
+   Funil: iBridge (Call Center) -> Auditoria -> Repasse/Crédito
+   Chave de cruzamento entre etapas: CPF (no iBridge = campo "Código")
+   ============================================================ */
+
+/* ---------- Configuração ---------- */
+const PLANO_VALOR_PADRAO = 79.9;   // valor final ao cliente Sempre Odonto (R$)
+const COMISSAO_PCT_PADRAO = 0.30;  // GT recebe 30% do valor da venda (recorrente)
+const SENHA_INICIAL = "123456";    // 1º acesso; usuário troca por 6 dígitos únicos
+const SEED_VERSION = 2;            // ao subir, recarrega o cadastro nativo de usuários
+
+const STORAGE_KEYS = {
+  ibridge: "credgt:ibridge",
+  auditoria: "credgt:auditoria",
+  repasse: "credgt:repasse",
+  repasses: "credgt:repasses",
+  config: "credgt:config",
+  users: "credgt:users",
+  session: "credgt:session", // sessão local por dispositivo
+  campanhas: "credgt:campanhas",
+};
+
+/* Campanha padrão (exemplo do parceiro Sempre Odonto): vendas auditadas de
+   jun a dez/2026 -> 1ª venda creditada a 50%, recorrência volta a 30%. */
+const SEED_CAMPANHAS = [
+  {
+    id: "camp_so2026",
+    nome: "Campanha Sempre Odonto 2026",
+    ativa: true,
+    inicio: "2026-06-01",
+    fim: "2026-12-31",
+    pctPrimeira: 0.50,
+    pctRecorrente: 0.30,
+    vantagem: "Vendas auditadas entre jun/2026 e dez/2026: o 1º repasse (primeira venda creditada) é de 50% do valor do produto; da segunda cobrança em diante (recorrência) volta a 30%.",
+  },
+];
+
+/* ---------- Paleta da marca Cred GT (extraída da logo) ---------- */
+const BRAND = {
+  blue: "#3585BC", blueDk: "#2F6E9E", blueDeep: "#27577D",
+  teal: "#5CBFBF", tealLt: "#9ED8D8", mint: "#CFE4D2",
+  gray: "#8E9296", ink: "#1F2D3A", paper: "#F1F5F8",
+};
+
+/* ---------- Menus do sistema (chave = rota) — usados na sidebar e nas flags de acesso ---------- */
+const MENU_DEFS = [
+  ["dashboard", "Dashboard", LayoutDashboard],
+  ["ibridge", "Vendas iBridge", Phone],
+  ["auditadas", "Vendas Auditadas", ShieldCheck],
+  ["creditadas", "Vendas Creditadas", CreditCard],
+  ["projecao", "Projeção", TrendingUp],
+  ["campanhas", "Campanhas", Megaphone],
+  ["relatorios", "Relatórios", FileText],
+  ["usuarios", "Usuários", UserCog],
+];
+const MENU_KEYS = MENU_DEFS.map((d) => d[0]);
+const menusAll = () => Object.fromEntries(MENU_KEYS.map((k) => [k, true]));
+const menusFrom = (keys) => Object.fromEntries(MENU_KEYS.map((k) => [k, keys.includes(k)]));
+const senhaValida = (s) => /^\d{6}$/.test(String(s || ""));
+
+const SEED_USERS = [
+  { id: "u_gabriel", nome: "Gabriel Redante", email: "gabriel@grupogt.net.br", login: "gabriel", senha: SENHA_INICIAL, precisaSenha: true, papel: "admin", menus: menusAll() },
+  { id: "u_roberta", nome: "Roberta Aires", email: "lidercred01@grupogt.net.br", login: "roberta", senha: SENHA_INICIAL, precisaSenha: true, papel: "admin", menus: menusAll() },
+  { id: "u_isabel", nome: "Isabel Franco", email: "lidercred02@grupogt.net.br", login: "isabel", senha: SENHA_INICIAL, precisaSenha: true, papel: "admin", menus: menusAll() },
+];
+function migrarUsers(arr) {
+  if (!arr || !arr.length) return null;
+  return arr.map((u) => ({ ...u, menus: u.menus || menusAll(), precisaSenha: u.precisaSenha !== undefined ? u.precisaSenha : true }));
+}
+
+/* ---------- Camada de armazenamento (persiste entre sessões) ----------
+   Usa window.storage quando disponível (ambiente Claude). Em deploy próprio
+   (GitHub Pages), basta trocar este objeto por Firebase — toda a persistência
+   está isolada aqui. Dados da equipe (vendas, usuários) ficam compartilhados;
+   apenas a sessão (credgt:session) é local por dispositivo. */
+const store = {
+  async get(key) {
+    try {
+      if (typeof window !== "undefined" && window.storage) {
+        const r = await window.storage.get(key);
+        return r ? JSON.parse(r.value) : null;
+      }
+    } catch (e) { /* chave inexistente ou indisponível */ }
+    return null;
+  },
+  async set(key, value) {
+    try {
+      if (typeof window !== "undefined" && window.storage) {
+        await window.storage.set(key, JSON.stringify(value));
+      }
+    } catch (e) { console.warn("storage.set falhou", e); }
+  },
+  async del(key) {
+    try {
+      if (typeof window !== "undefined" && window.storage) {
+        await window.storage.delete(key);
+      }
+    } catch (e) { /* noop */ }
+  },
+};
+
+/* ---------- Helpers ---------- */
+const onlyDigits = (s) => String(s ?? "").replace(/\D/g, "");
+const normCpf = (v) => {
+  const d = onlyDigits(v);
+  if (!d) return null;
+  return d.padStart(11, "0").slice(-11);
+};
+const stripAccents = (s) =>
+  String(s ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+const normKey = (s) => stripAccents(s).trim().toUpperCase().replace(/\s+/g, " ");
+
+const fmtBRL = (n) =>
+  (Number(n) || 0).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+const fmtInt = (n) => (Number(n) || 0).toLocaleString("pt-BR");
+const fmtPct = (n) => `${((Number(n) || 0) * 100).toFixed(1)}%`;
+
+/* Converte valores monetários em texto para número.
+   Lida com "R$ 4,002.99" (en-US: vírgula=milhar, ponto=decimal),
+   "R$ 9.028,70" (pt-BR: ponto=milhar, vírgula=decimal), "79,90" e números puros. */
+function parseMoney(v) {
+  if (v == null || v === "") return 0;
+  if (typeof v === "number") return isNaN(v) ? 0 : v;
+  let s = String(v).trim().replace(/[^0-9.,-]/g, ""); // tira "R$", espaços, etc.
+  if (!s) return 0;
+  const lastComma = s.lastIndexOf(",");
+  const lastDot = s.lastIndexOf(".");
+  if (lastComma > -1 && lastDot > -1) {
+    // ambos presentes: o separador mais à direita é o decimal
+    if (lastComma > lastDot) s = s.replace(/\./g, "").replace(",", "."); // pt-BR
+    else s = s.replace(/,/g, "");                                        // en-US
+  } else if (lastComma > -1) {
+    s = s.replace(",", "."); // só vírgula -> decimal (pt-BR ex.: 79,90)
+  }
+  const n = Number(s);
+  return isNaN(n) ? 0 : n;
+}
+
+/* Converte percentual em fração. "62%" -> 0.62, "0,48" -> 0.48, 62 -> 0.62 */
+function parsePct(v) {
+  if (v == null || v === "") return 0;
+  const hasPct = String(v).includes("%");
+  const n = parseMoney(String(v).replace("%", ""));
+  if (hasPct) return n / 100;
+  return n > 1 ? n / 100 : n;
+}
+
+/* Mês de uma dataISO (aaaa-mm) e rótulo amigável */
+const mesDeISO = (iso) => (iso ? String(iso).slice(0, 7) : null);
+const MESES_PT = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"];
+const labelMes = (ym) => { if (!ym) return "—"; const [y, m] = ym.split("-"); return `${MESES_PT[Number(m) - 1] || m}/${y.slice(2)}`; };
+const mesAtualISO = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`; };
+/* Identidade física de um fechamento (para acumular uploads sem duplicar) */
+const uidIb = (r) => `${r.cpf || "?"}|${r.dataISO || "?"}|${r.hora || "?"}`;
+
+/* Campanha ativa que cobre uma data (aaaa-mm-dd). Retorna a 1ª que casar. */
+function campanhaDaData(campanhas, iso) {
+  if (!iso || !campanhas) return null;
+  return campanhas.find((c) => c.ativa && (!c.inicio || iso >= c.inicio) && (!c.fim || iso <= c.fim)) || null;
+}
+
+/* Lê período e valor a partir do nome do arquivo da quinzena.
+   Ex.: "01_06_26_A_15_06_26_-_9028_70.xlsx" -> {ini:2026-06-01, fim:2026-06-15, valor:9028.70} */
+function metaFromFilename(name) {
+  const m = String(name || "").match(/(\d{2})_(\d{2})_(\d{2})_A_(\d{2})_(\d{2})_(\d{2})(?:_-_(\d+)_(\d+))?/);
+  if (!m) return null;
+  const [, d1, m1, y1, d2, m2, y2, intp, decp] = m;
+  const ini = `20${y1}-${m1}-${d1}`, fim = `20${y2}-${m2}-${d2}`;
+  const valor = intp != null ? parseMoney(`${intp}.${decp}`) : null;
+  return { ini, fim, valor };
+}
+const brFromISO = (iso) => { if (!iso) return ""; const [y, m, d] = String(iso).split("-"); return `${d}/${m}/${y}`; };
+const labelQuinzena = (ini, fim) => `${brFromISO(ini)} a ${brFromISO(fim)}`;
+
+/* Datas: aceita dd/mm/aaaa, aaaa-mm-dd e objetos Date serializados */
+function parseData(v) {
+  if (v == null || v === "") return null;
+  if (v instanceof Date) {
+    return { iso: v.toISOString().slice(0, 10), br: brFromISO(v.toISOString().slice(0, 10)) };
+  }
+  const s = String(v).trim();
+  let m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+  if (m) {
+    let [, d, mo, y] = m;
+    // Heurística: se o "mês" > 12 e o "dia" <= 12, está em M/D (ex.: estornos "6/15/26")
+    if (Number(mo) > 12 && Number(d) <= 12) { const t = d; d = mo; mo = t; }
+    if (y.length === 2) y = "20" + y;
+    const iso = `${y}-${mo.padStart(2, "0")}-${d.padStart(2, "0")}`;
+    return { iso, br: `${d.padStart(2, "0")}/${mo.padStart(2, "0")}/${y}` };
+  }
+  m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (m) {
+    const [, y, mo, d] = m;
+    const iso = `${y}-${mo.padStart(2, "0")}-${d.padStart(2, "0")}`;
+    return { iso, br: brFromISO(iso) };
+  }
+  return null;
+}
+
+/* Normaliza resultado da auditoria (coluna ELEGIVEL, cheia de variações) */
+function normElegivel(v) {
+  const s = stripAccents(String(v ?? "")).trim().toLowerCase();
+  if (s === "sim" || s === "s" || s === "elegivel") return "APROVADA";
+  if (s === "nao" || s === "n" || s === "nao elegivel" || s === "inelegivel") return "RECUSADA";
+  return "VERIFICAR"; // vazio, ".", "talvez", "sem audio", "audio curto", etc.
+}
+
+/* Normaliza retorno do banco (coluna RETORNO do Repasse) */
+function normRetorno(v) {
+  const s = stripAccents(String(v ?? "")).trim().toUpperCase();
+  if (!s) return "SEM_RETORNO";
+  if (s.includes("QUITAD")) return "CREDITADO";
+  if (s.includes("CANCELAMENTO") || s.includes("CANCELAD")) return "CANCELADO";
+  if (s.includes("NAO EFETUADO") || s.includes("INVALID") || s.includes("INSUFICIEN") ||
+      s.includes("NAO CADASTR") || s.includes("NAO PERTENCE") || s.includes("RESTRIC"))
+    return "NAO_EFETUADO";
+  return "OUTRO";
+}
+
+/* Mapeia cabeçalhos reais -> campos canônicos, tolerando acentos/espaços */
+function buildRow(rawRow, aliasMap) {
+  const norm = {};
+  for (const k of Object.keys(rawRow)) norm[normKey(k)] = rawRow[k];
+  const out = {};
+  for (const [field, aliases] of Object.entries(aliasMap)) {
+    let val = null;
+    for (const a of aliases) {
+      const nk = normKey(a);
+      if (nk in norm && norm[nk] != null && String(norm[nk]).trim() !== "") {
+        val = norm[nk];
+        break;
+      }
+    }
+    out[field] = val;
+  }
+  return out;
+}
+
+/* ---------- Leitura de arquivo (xlsx ou csv, com encoding seguro) ---------- */
+function lerArquivo(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    const isCsv = /\.csv$/i.test(file.name);
+    reader.onerror = () => reject(reader.error || new Error("Falha ao ler arquivo"));
+    reader.onload = (e) => {
+      try {
+        if (isCsv) {
+          const buf = e.target.result;
+          let txt = new TextDecoder("utf-8").decode(buf);
+          if (txt.includes("\uFFFD")) txt = new TextDecoder("windows-1252").decode(buf);
+          resolve(XLSX.read(txt, { type: "string", raw: false }));
+        } else {
+          resolve(XLSX.read(e.target.result, { type: "array", cellDates: true }));
+        }
+      } catch (err) { reject(err); }
+    };
+    reader.readAsArrayBuffer(file);
+  });
+}
+const sheetObjs = (wb, name) =>
+  XLSX.utils.sheet_to_json(wb.Sheets[name], { defval: null, raw: false });
+const sheetAOA = (wb, name) =>
+  XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, defval: null, raw: false });
+
+/* ---------- Parsers por etapa ---------- */
+const ALIAS_IBRIDGE = {
+  cpf: ["Código", "Codigo", "CPF"],
+  nome: ["Contato", "Nome"],
+  data: ["Data"],
+  hora: ["Hora"],
+  operador: ["Operador"],
+  equipe: ["Equipe"],
+  telefone: ["Telefone"],
+  operacao: ["Operação", "Operacao"],
+  mailing: ["Mailing"],
+  ocorrencia: ["Ocorrência", "Ocorrencia"],
+};
+function parseIbridge(wb) {
+  const rows = sheetObjs(wb, wb.SheetNames[0]);
+  const out = [];
+  for (const r of rows) {
+    const b = buildRow(r, ALIAS_IBRIDGE);
+    const cpf = normCpf(b.cpf);
+    if (!cpf && !b.nome) continue;
+    const d = parseData(b.data);
+    const row = {
+      cpf,
+      nome: (b.nome || "").toString().trim(),
+      dataISO: d?.iso || null,
+      dataBR: d?.br || (b.data || ""),
+      hora: b.hora || "",
+      operador: (b.operador || "").toString().trim(),
+      equipe: (b.equipe || "").toString().trim(),
+      telefone: b.telefone || "",
+      operacao: b.operacao || "",
+      mailing: b.mailing || "",
+    };
+    row.mesISO = mesDeISO(row.dataISO);
+    row.uid = uidIb(row);
+    out.push(row);
+  }
+  return out;
+}
+
+const ALIAS_AUD = {
+  cpf: ["CPF", "Código", "Codigo"],
+  nome: ["Nome", "Contato"],
+  data: ["Data"],
+  parceiro: ["Parceiro", "Empresa"],
+  elegivel: ["Elegivel", "Elegível", "Status", "Resultado"],
+  operador: ["Operador"],
+  motivo: ["Motivo", "Observação", "Observacao"],
+};
+function parseAuditoria(wb) {
+  const rows = sheetObjs(wb, wb.SheetNames[0]);
+  const out = [];
+  for (const r of rows) {
+    const b = buildRow(r, ALIAS_AUD);
+    const cpf = normCpf(b.cpf);
+    if (!cpf && !b.nome) continue;
+    const d = parseData(b.data);
+    out.push({
+      cpf,
+      nome: (b.nome || "").toString().trim(),
+      dataISO: d?.iso || null,
+      dataBR: d?.br || (b.data || ""),
+      parceiro: (b.parceiro || "").toString().trim(),
+      status: normElegivel(b.elegivel),
+      elegivelRaw: (b.elegivel || "").toString().trim(),
+      operador: (b.operador || "").toString().trim(),
+      motivo: (b.motivo || "").toString().trim(),
+    });
+  }
+  return out;
+}
+
+/* Repasse: workbook multi-aba (Clientes / Resumo / Estornados) */
+const ALIAS_REP_CLI = {
+  nome: ["Nome"], cpf: ["CPF"], retorno: ["Retorno", "Retorno Bancario", "Status"],
+  empresa: ["Empresa", "Parceiro"], parcela: ["Parcela"],
+};
+const ALIAS_REP_EST = {
+  data: ["Data"], nome: ["Nome"], cpf: ["CPF"], valor: ["Valor"], empresa: ["Empresa", "Parceiro"],
+};
+function classifySheet(wb, name) {
+  const aoa = sheetAOA(wb, name).slice(0, 4);
+  const headerCells = aoa.flat().map((c) => normKey(c));
+  const nm = normKey(name);
+  if (nm.includes("CLIENTE") || nm.includes("CREDITO") || headerCells.includes("RETORNO") || headerCells.includes("RETORNO BANCARIO")) return "clientes";
+  if (nm.includes("ESTORN") || (headerCells.includes("VALOR") && headerCells.includes("CPF") && !headerCells.includes("RETORNO"))) return "estornados";
+  if (nm.includes("RESUMO") || (headerCells.includes("REPASSE") && (headerCells.includes("EMPRESA") || headerCells.includes("VIDAS")))) return "resumo";
+  return "ignorar";
+}
+function parseRepasse(wb) {
+  const clientes = [], estornados = [];
+  let resumo = { empresas: [], valorAReceber: null };
+  for (const name of wb.SheetNames) {
+    const tipo = classifySheet(wb, name);
+    if (tipo === "clientes") {
+      for (const r of sheetObjs(wb, name)) {
+        const b = buildRow(r, ALIAS_REP_CLI);
+        const cpf = normCpf(b.cpf);
+        if (!cpf && !b.nome) continue;
+        const parc = b.parcela != null && String(b.parcela).trim() !== "" ? Number(onlyDigits(b.parcela)) || null : null;
+        clientes.push({
+          cpf, nome: (b.nome || "").toString().trim(),
+          retornoRaw: (b.retorno || "").toString().trim(),
+          retorno: normRetorno(b.retorno),
+          empresa: (b.empresa || "").toString().trim(),
+          parcela: parc,
+        });
+      }
+    } else if (tipo === "estornados") {
+      for (const r of sheetObjs(wb, name)) {
+        const b = buildRow(r, ALIAS_REP_EST);
+        const cpf = normCpf(b.cpf);
+        if (!cpf && !b.nome) continue;
+        const d = parseData(b.data);
+        estornados.push({
+          cpf, nome: (b.nome || "").toString().trim(),
+          dataBR: d?.br || (b.data || ""),
+          valor: parseMoney(b.valor),
+          empresa: (b.empresa || "").toString().trim(),
+        });
+      }
+    } else if (tipo === "resumo") {
+      const aoa = sheetAOA(wb, name);
+      let hi = aoa.findIndex((row) => row.map(normKey).includes("EMPRESA") && row.map(normKey).includes("REPASSE"));
+      if (hi >= 0) {
+        const hdr = aoa[hi].map(normKey);
+        const idx = (k) => hdr.indexOf(k);
+        for (let i = hi + 1; i < aoa.length; i++) {
+          const row = aoa[i];
+          const emp = row[idx("EMPRESA")];
+          if (!emp) continue;
+          const empN = normKey(emp);
+          if (empN.includes("VALOR A RECEBER")) {
+            resumo.valorAReceber = parseMoney(row[idx("ENVIO")] ?? row[1]) || null;
+            continue;
+          }
+          resumo.empresas.push({
+            empresa: String(emp).trim(),
+            envio: Number(onlyDigits(row[idx("ENVIO")])) || 0,
+            vidas: Number(onlyDigits(row[idx("VIDAS")])) || 0,
+            estornados: parseMoney(row[idx("ESTORNADOS")]),
+            repasse: parseMoney(row[idx("REPASSE")]),
+            conversao: parsePct(row[idx("CONVERSAO")]),
+          });
+        }
+      } else {
+        // Formato antigo: VIDAS | REPASSE (sem empresa) — total único
+        let hv = aoa.findIndex((row) => row.map(normKey).includes("REPASSE") && row.map(normKey).includes("VIDAS"));
+        if (hv >= 0) {
+          const hdr = aoa[hv].map(normKey);
+          const idx = (k) => hdr.indexOf(k);
+          const linha = aoa[hv + 1] || [];
+          resumo.empresas.push({
+            empresa: "Total",
+            envio: 0,
+            vidas: Number(onlyDigits(linha[idx("VIDAS")])) || 0,
+            estornados: 0,
+            repasse: parseMoney(linha[idx("REPASSE")]),
+            conversao: 0,
+          });
+        }
+      }
+    }
+  }
+  return { clientes, estornados, resumo };
+}
+
+/* ---------- Logo Cred GT (imagem oficial embutida) ---------- */
+const LOGO_DATAURI = "data:image/png;base64,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";
+function CredGTLogo({ size = 40, light = false }) {
+  // size = altura em px; a largura segue a proporção da arte (~2:1)
+  if (light) {
+    return (
+      <span className="inline-flex items-center rounded-lg bg-white px-2.5 py-1.5 shadow-sm">
+        <img src={LOGO_DATAURI} alt="Cred GT" style={{ height: size, width: "auto", display: "block" }} />
+      </span>
+    );
+  }
+  return <img src={LOGO_DATAURI} alt="Cred GT" style={{ height: size, width: "auto", display: "block" }} />;
+}
+
+/* ---------- UI atômica ---------- */
+const STATUS_THEME = {
+  APROVADA:    { label: "Aprovada",     cls: "bg-emerald-50 text-emerald-700 ring-emerald-600/20" },
+  RECUSADA:    { label: "Recusada",     cls: "bg-rose-50 text-rose-700 ring-rose-600/20" },
+  VERIFICAR:   { label: "A verificar",  cls: "bg-amber-50 text-amber-700 ring-amber-600/20" },
+  PENDENTE:    { label: "Sem auditoria",cls: "bg-slate-100 text-slate-600 ring-slate-500/20" },
+  CREDITADO:   { label: "Creditado",    cls: "bg-emerald-50 text-emerald-700 ring-emerald-600/20" },
+  NAO_EFETUADO:{ label: "Não efetuado", cls: "bg-amber-50 text-amber-700 ring-amber-600/20" },
+  CANCELADO:   { label: "Cancelado",    cls: "bg-rose-50 text-rose-700 ring-rose-600/20" },
+  EM_TRANSITO: { label: "Em trânsito",  cls: "bg-sky-50 text-sky-700 ring-sky-600/20" },
+  SEM_RETORNO: { label: "Sem retorno",  cls: "bg-slate-100 text-slate-600 ring-slate-500/20" },
+  OUTRO:       { label: "Outro",        cls: "bg-slate-100 text-slate-600 ring-slate-500/20" },
+};
+function Badge({ status }) {
+  const t = STATUS_THEME[status] || { label: status, cls: "bg-slate-100 text-slate-600 ring-slate-500/20" };
+  return <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${t.cls}`}>{t.label}</span>;
+}
+
+function Kpi({ icon: Icon, label, value, sub, tone = "slate" }) {
+  const tones = {
+    slate: "text-slate-500 bg-slate-100",
+    emerald: "text-emerald-600 bg-emerald-50",
+    sky: "text-sky-600 bg-sky-50",
+    amber: "text-amber-600 bg-amber-50",
+    rose: "text-rose-600 bg-rose-50",
+    violet: "text-violet-600 bg-violet-50",
+    blue: "text-[#2F6E9E] bg-[#EAF3FA]",
+    teal: "text-[#2C8E8E] bg-[#E6F6F6]",
+  };
+  return (
+    <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+      <div className="flex items-center justify-between">
+        <span className="text-xs font-medium uppercase tracking-wide text-slate-500">{label}</span>
+        <span className={`grid h-8 w-8 place-items-center rounded-lg ${tones[tone]}`}><Icon size={16} /></span>
+      </div>
+      <div className="mt-2 text-2xl font-semibold text-slate-900">{value}</div>
+      {sub && <div className="mt-0.5 text-xs text-slate-500">{sub}</div>}
+    </div>
+  );
+}
+
+function UploadCard({ title, hint, accept, onFile, count, onClear, loading }) {
+  const inputId = "up-" + title.replace(/\s+/g, "");
+  return (
+    <div className="rounded-xl border border-dashed border-slate-300 bg-white p-5">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h3 className="text-sm font-semibold text-slate-800">{title}</h3>
+          <p className="mt-0.5 text-xs text-slate-500">{hint}</p>
+        </div>
+        <div className="flex items-center gap-2">
+          {count > 0 && (
+            <span className="rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-medium text-emerald-700 ring-1 ring-inset ring-emerald-600/20">
+              {fmtInt(count)} registros
+            </span>
+          )}
+          <label htmlFor={inputId}
+            className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg bg-slate-900 px-3 py-2 text-xs font-medium text-white hover:bg-slate-700">
+            {loading ? <RefreshCw size={14} className="animate-spin" /> : <Upload size={14} />}
+            {loading ? "Processando…" : "Enviar planilha"}
+          </label>
+          <input id={inputId} type="file" accept={accept} className="hidden"
+            onChange={(e) => { const f = e.target.files?.[0]; if (f) onFile(f); e.target.value = ""; }} />
+          {count > 0 && (
+            <button onClick={onClear} title="Limpar dados"
+              className="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-2.5 py-2 text-xs text-slate-600 hover:bg-slate-50">
+              <Trash2 size={14} />
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SectionTitle({ children, right }) {
+  return (
+    <div className="mb-3 flex items-center justify-between">
+      <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-700">{children}</h2>
+      {right}
+    </div>
+  );
+}
+
+/* Tabela reutilizável: busca, filtros, paginação */
+function DataTable({ columns, rows, searchKeys = [], filters = [], pageSize = 25, empty = "Nenhum registro." }) {
+  const [q, setQ] = useState("");
+  const [fvals, setFvals] = useState({});
+  const [page, setPage] = useState(0);
+  useEffect(() => setPage(0), [q, fvals, rows]);
+
+  const filtered = useMemo(() => {
+    const term = stripAccents(q).toLowerCase().trim();
+    return rows.filter((r) => {
+      for (const f of filters) {
+        const v = fvals[f.key];
+        if (v && v !== "__all__" && String(r[f.key] ?? "") !== v) return false;
+      }
+      if (!term) return true;
+      return searchKeys.some((k) => stripAccents(String(r[k] ?? "")).toLowerCase().includes(term));
+    });
+  }, [rows, q, fvals, filters, searchKeys]);
+
+  const total = filtered.length;
+  const start = page * pageSize;
+  const pageRows = filtered.slice(start, start + pageSize);
+  const maxPage = Math.max(0, Math.ceil(total / pageSize) - 1);
+
+  return (
+    <div className="rounded-xl border border-slate-200 bg-white shadow-sm">
+      <div className="flex flex-wrap items-center gap-2 border-b border-slate-100 p-3">
+        {searchKeys.length > 0 && (
+          <div className="relative flex-1 min-w-[200px]">
+            <Search size={14} className="absolute left-2.5 top-2.5 text-slate-400" />
+            <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Buscar por nome ou CPF…"
+              className="w-full rounded-lg border border-slate-200 py-2 pl-8 pr-3 text-sm outline-none focus:border-slate-400" />
+          </div>
+        )}
+        {filters.map((f) => (
+          <div key={f.key} className="flex items-center gap-1.5">
+            <Filter size={13} className="text-slate-400" />
+            <select value={fvals[f.key] || "__all__"} onChange={(e) => setFvals((p) => ({ ...p, [f.key]: e.target.value }))}
+              className="rounded-lg border border-slate-200 py-2 pl-2 pr-7 text-sm text-slate-700 outline-none focus:border-slate-400">
+              <option value="__all__">{f.label}: todos</option>
+              {f.options.map((o) => <option key={o} value={o}>{o}</option>)}
+            </select>
+          </div>
+        ))}
+        <span className="ml-auto text-xs text-slate-500">{fmtInt(total)} registros</span>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="border-b border-slate-100 text-left text-xs uppercase tracking-wide text-slate-500">
+              {columns.map((c) => <th key={c.key} className="px-3 py-2 font-medium whitespace-nowrap">{c.title}</th>)}
+            </tr>
+          </thead>
+          <tbody>
+            {pageRows.length === 0 ? (
+              <tr><td colSpan={columns.length} className="px-3 py-10 text-center text-slate-400">{empty}</td></tr>
+            ) : pageRows.map((r, i) => (
+              <tr key={i} className="border-b border-slate-50 hover:bg-slate-50/60">
+                {columns.map((c) => (
+                  <td key={c.key} className="px-3 py-2 align-top text-slate-700 whitespace-nowrap">
+                    {c.render ? c.render(r) : (r[c.key] ?? "—")}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {total > pageSize && (
+        <div className="flex items-center justify-between border-t border-slate-100 p-3 text-xs text-slate-600">
+          <span>{fmtInt(start + 1)}–{fmtInt(Math.min(start + pageSize, total))} de {fmtInt(total)}</span>
+          <div className="flex items-center gap-1">
+            <button disabled={page === 0} onClick={() => setPage((p) => p - 1)}
+              className="rounded-md border border-slate-200 p-1.5 disabled:opacity-40 hover:bg-slate-50"><ChevronLeft size={14} /></button>
+            <span className="px-2">{page + 1} / {maxPage + 1}</span>
+            <button disabled={page >= maxPage} onClick={() => setPage((p) => p + 1)}
+              className="rounded-md border border-slate-200 p-1.5 disabled:opacity-40 hover:bg-slate-50"><ChevronRight size={14} /></button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------- App ---------- */
+const MENUS = MENU_DEFS.map(([id, label, icon]) => ({ id, label, icon }));
+const CHART_COLORS = [BRAND.blue, BRAND.teal, "#d97706", "#e11d48", BRAND.blueDeep, BRAND.gray, "#16a34a"];
+
+function App() {
+  const [menu, setMenu] = useState("dashboard");
+  const [ibridge, setIbridge] = useState([]);
+  const [auditoria, setAuditoria] = useState([]);
+  const [repasses, setRepasses] = useState([]); // histórico de quinzenas de crédito
+  const [planoValor, setPlanoValor] = useState(PLANO_VALOR_PADRAO);
+  const [comissaoPct, setComissaoPct] = useState(COMISSAO_PCT_PADRAO);
+  const [campanhas, setCampanhas] = useState([]);
+  const [loading, setLoading] = useState("");
+  const [toast, setToast] = useState(null);
+
+  // Autenticação
+  const [users, setUsers] = useState(null);     // null = carregando
+  const [sessao, setSessao] = useState(null);    // usuário logado
+  const [booted, setBooted] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      const [ib, au, rps, rpOld, cfg, us, ss, cps] = await Promise.all([
+        store.get(STORAGE_KEYS.ibridge), store.get(STORAGE_KEYS.auditoria),
+        store.get(STORAGE_KEYS.repasses), store.get(STORAGE_KEYS.repasse), store.get(STORAGE_KEYS.config),
+        store.get(STORAGE_KEYS.users), store.get(STORAGE_KEYS.session),
+        store.get(STORAGE_KEYS.campanhas),
+      ]);
+      if (ib) setIbridge(ib);
+      if (au) setAuditoria(au);
+      if (rps && rps.length) setRepasses(rps);
+      else if (rpOld && rpOld.clientes?.length) {
+        // migra a planilha única antiga para uma quinzena do histórico
+        const mig = [{ id: "q_legado", periodoIni: "", periodoFim: "", dataPagamento: "", valorCreditado: rpOld.resumo?.empresas?.reduce((s, e) => s + (e.repasse || 0), 0) || 0, label: "Importação anterior", ...rpOld, criadoEm: Date.now() }];
+        setRepasses(mig); await store.set(STORAGE_KEYS.repasses, mig);
+      }
+      if (cfg?.planoValor) setPlanoValor(cfg.planoValor);
+      if (cfg?.comissaoPct != null) setComissaoPct(cfg.comissaoPct);
+      if (cps && cps.length) setCampanhas(cps);
+      else { setCampanhas(SEED_CAMPANHAS); await store.set(STORAGE_KEYS.campanhas, SEED_CAMPANHAS); }
+      const precisaSeed = !us || cfg?.seedVersion !== SEED_VERSION;
+      const lista = precisaSeed ? SEED_USERS : (migrarUsers(us) || SEED_USERS);
+      setUsers(lista);
+      if (precisaSeed) {
+        await store.set(STORAGE_KEYS.users, lista);
+        await store.set(STORAGE_KEYS.config, { planoValor: cfg?.planoValor ?? PLANO_VALOR_PADRAO, comissaoPct: cfg?.comissaoPct ?? COMISSAO_PCT_PADRAO, seedVersion: SEED_VERSION });
+      }
+      if (ss?.login) {
+        const u = lista.find((x) => x.login === ss.login);
+        if (u) setSessao(u);
+      }
+      setBooted(true);
+    })();
+  }, []);
+
+  const flash = (msg, ok = true) => { setToast({ msg, ok }); setTimeout(() => setToast(null), 4000); };
+
+  /* ---------- Usuários / sessão ---------- */
+  const persistUsers = async (lista) => { setUsers(lista); await store.set(STORAGE_KEYS.users, lista); };
+  const doLogin = async (login, senha) => {
+    const u = (users || []).find((x) => x.login === String(login).trim().toLowerCase());
+    if (!u) return { erro: "Usuário não encontrado." };
+    if (String(senha) !== String(u.senha)) return { erro: "Senha incorreta." };
+    if (u.precisaSenha) return { primeiroAcesso: u };
+    setSessao(u); await store.set(STORAGE_KEYS.session, { login: u.login });
+    return { ok: true };
+  };
+  const definirSenha = async (userId, novaSenha) => {
+    if (!senhaValida(novaSenha)) return { erro: "A senha deve ter exatamente 6 dígitos numéricos." };
+    if ((users || []).some((x) => x.id !== userId && x.senha === novaSenha)) return { erro: "Essa senha já está em uso por outro usuário. Escolha outra." };
+    const lista = users.map((x) => x.id === userId ? { ...x, senha: novaSenha, precisaSenha: false } : x);
+    await persistUsers(lista);
+    const u = lista.find((x) => x.id === userId);
+    setSessao(u); await store.set(STORAGE_KEYS.session, { login: u.login });
+    return { ok: true };
+  };
+  const logout = async () => { setSessao(null); await store.del(STORAGE_KEYS.session); setMenu("dashboard"); };
+
+  const handleUpload = useCallback(async (file, kind) => {
+    setLoading(kind);
+    try {
+      const wb = await lerArquivo(file);
+      if (kind === "ibridge") {
+        const novos = parseIbridge(wb);
+        if (!novos.length) throw new Error("Nenhuma venda encontrada. Confira se a planilha tem a coluna 'Código' e 'Contato'.");
+        // Acumula com as vendas já existentes, sem duplicar (chave = CPF|data|hora)
+        let acumulado, addNovos = 0;
+        setIbridge((prev) => {
+          const mapa = new Map(prev.map((r) => [r.uid || uidIb(r), r]));
+          const antes = mapa.size;
+          for (const r of novos) mapa.set(r.uid || uidIb(r), r);
+          acumulado = [...mapa.values()].sort((a, b) => (b.dataISO || "").localeCompare(a.dataISO || ""));
+          addNovos = mapa.size - antes;
+          return acumulado;
+        });
+        await store.set(STORAGE_KEYS.ibridge, acumulado);
+        flash(`iBridge acumulado: +${fmtInt(addNovos)} novos fechamentos (${fmtInt(acumulado.length)} no total).`);
+      } else if (kind === "auditoria") {
+        const data = parseAuditoria(wb);
+        if (!data.length) throw new Error("Nenhum registro de auditoria encontrado. Confira as colunas CPF / ELEGÍVEL.");
+        setAuditoria(data); await store.set(STORAGE_KEYS.auditoria, data);
+        flash(`Auditoria atualizada: ${fmtInt(data.length)} registros importados.`);
+      }
+    } catch (e) {
+      flash(e.message || "Falha ao processar a planilha.", false);
+    } finally { setLoading(""); }
+  }, []);
+
+  // Lê o arquivo de uma quinzena e devolve {parsed, meta} para o formulário (sem persistir)
+  const lerQuinzena = useCallback(async (file) => {
+    const wb = await lerArquivo(file);
+    const parsed = parseRepasse(wb);
+    if (!parsed.clientes.length) throw new Error("Nenhum cliente encontrado na planilha. Confira as abas Clientes/CRÉDITO.");
+    return { parsed, meta: metaFromFilename(file.name) };
+  }, []);
+  const addQuinzena = async (entry) => {
+    const nova = [...repasses.filter((q) => q.id !== entry.id), entry]
+      .sort((a, b) => (a.periodoIni || "").localeCompare(b.periodoIni || ""));
+    setRepasses(nova); await store.set(STORAGE_KEYS.repasses, nova);
+    flash(`Quinzena ${entry.label} salva: ${fmtInt(entry.clientes.length)} registros · ${fmtBRL(entry.valorCreditado)}.`);
+  };
+  const removeQuinzena = async (id) => {
+    const nova = repasses.filter((q) => q.id !== id);
+    setRepasses(nova); await store.set(STORAGE_KEYS.repasses, nova);
+  };
+
+  const clearKind = async (kind) => {
+    if (kind === "ibridge") { setIbridge([]); await store.del(STORAGE_KEYS.ibridge); }
+    if (kind === "auditoria") { setAuditoria([]); await store.del(STORAGE_KEYS.auditoria); }
+    if (kind === "repasse") { setRepasses([]); await store.del(STORAGE_KEYS.repasses); }
+  };
+  const updateConfig = async (patch) => {
+    if (patch.planoValor != null) setPlanoValor(patch.planoValor);
+    if (patch.comissaoPct != null) setComissaoPct(patch.comissaoPct);
+    const cfg = { planoValor: patch.planoValor ?? planoValor, comissaoPct: patch.comissaoPct ?? comissaoPct, seedVersion: SEED_VERSION };
+    await store.set(STORAGE_KEYS.config, cfg);
+  };
+  const updatePlano = (v) => updateConfig({ planoValor: v });
+  const persistCampanhas = async (lista) => { setCampanhas(lista); await store.set(STORAGE_KEYS.campanhas, lista); };
+
+  /* ---------- Modelo de dados cruzado (o coração do funil) ---------- */
+  const model = useMemo(() => {
+    // Mapas por CPF (colisão resolvida por prioridade de "melhor desfecho")
+    const audByCpf = new Map();
+    const audPrio = { APROVADA: 3, RECUSADA: 2, VERIFICAR: 1 };
+    for (const a of auditoria) {
+      if (!a.cpf) continue;
+      const cur = audByCpf.get(a.cpf);
+      if (!cur || (audPrio[a.status] || 0) > (audPrio[cur.status] || 0)) audByCpf.set(a.cpf, a);
+    }
+    /* ---------- Repasses por quinzena (histórico) ---------- */
+    // Ordena quinzenas cronologicamente
+    const quinzenas = [...repasses].sort((a, b) => (a.periodoIni || "").localeCompare(b.periodoIni || ""));
+    // Para cada CPF: status de melhor desfecho + 1ª quitação (quinzena) + nº de quitações
+    const repByCpf = new Map();
+    const repPrio = { CREDITADO: 4, NAO_EFETUADO: 3, CANCELADO: 2, OUTRO: 1, SEM_RETORNO: 0 };
+    const credInfo = new Map(); // cpf -> { primeiroISO, quitacoes, ultimaISO }
+    const estByCpf = new Map();
+    for (const q of quinzenas) {
+      const refISO = q.periodoFim || q.periodoIni || "";
+      for (const c of (q.clientes || [])) {
+        if (!c.cpf) continue;
+        const cur = repByCpf.get(c.cpf);
+        if (!cur || (repPrio[c.retorno] || 0) > (repPrio[cur.retorno] || 0)) repByCpf.set(c.cpf, { ...c, quinzena: q.label });
+        if (c.retorno === "CREDITADO") {
+          const ci = credInfo.get(c.cpf) || { primeiroISO: refISO, quitacoes: 0, ultimaISO: refISO };
+          ci.quitacoes += 1;
+          if (refISO && (!ci.primeiroISO || refISO < ci.primeiroISO)) ci.primeiroISO = refISO;
+          if (refISO && (!ci.ultimaISO || refISO > ci.ultimaISO)) ci.ultimaISO = refISO;
+          credInfo.set(c.cpf, ci);
+        }
+      }
+      for (const e of (q.estornados || [])) if (e.cpf) estByCpf.set(e.cpf, e);
+    }
+    const temRepasses = quinzenas.length > 0;
+
+    // iBridge único por CPF (base do funil) — mantém venda mais recente
+    const ibByCpf = new Map();
+    for (const v of ibridge) {
+      if (!v.cpf) continue;
+      const cur = ibByCpf.get(v.cpf);
+      if (!cur || (v.dataISO || "") >= (cur.dataISO || "")) ibByCpf.set(v.cpf, v);
+    }
+
+    // Registros enriquecidos (todos os fechamentos, com classificação cruzada)
+    const enriched = ibridge.map((v) => {
+      const aud = v.cpf ? audByCpf.get(v.cpf) : null;
+      const statusAud = aud ? aud.status : "PENDENTE";
+      let statusCred = null;
+      if (statusAud === "APROVADA") {
+        const rp = v.cpf ? repByCpf.get(v.cpf) : null;
+        statusCred = rp ? rp.retorno : "EM_TRANSITO";
+      }
+      return {
+        ...v,
+        statusAud,
+        motivoAud: aud?.motivo || "",
+        statusCred,
+        estornado: v.cpf ? estByCpf.has(v.cpf) : false,
+        recorrencia: "NOVA", // definido abaixo, com base no histórico de CRÉDITO
+      };
+    });
+
+    /* 1ª venda × Recorrente — definido pelo HISTÓRICO de quinzenas creditadas.
+       Enquanto não houver planilha de creditadas, TODAS as vendas são "1ª venda".
+       A venda é Recorrente se o CPF já teve uma quitação numa quinzena ANTERIOR à entrada da venda. */
+    for (const v of enriched) {
+      const ci = v.cpf ? credInfo.get(v.cpf) : null;
+      v.recorrencia = (ci && ci.primeiroISO && v.dataISO && v.dataISO > ci.primeiroISO) ? "RECORRENTE" : "NOVA";
+    }
+
+    // Auditoria sem correspondência no iBridge (registros órfãos)
+    const ibCpfs = new Set(ibridge.map((v) => v.cpf).filter(Boolean));
+    const audSemIb = auditoria.filter((a) => a.cpf && !ibCpfs.has(a.cpf));
+
+    // iBridge sem auditoria -> "gerar classificação para verificação"
+    const audCpfs = new Set(auditoria.map((a) => a.cpf).filter(Boolean));
+    const ibSemAud = [...ibByCpf.values()].filter((v) => v.cpf && !audCpfs.has(v.cpf));
+
+    // Repasse sem auditoria (atraso venda->crédito; insumo da Projeção)
+    const repSemAud = [...credInfo.keys()].filter((cpf) => !audCpfs.has(cpf)).map((cpf) => ({ cpf }));
+
+    // ----- Carteira por quinzena (histórico) -----
+    const carteira = quinzenas.map((q) => {
+      const refISO = q.periodoFim || q.periodoIni || "";
+      let nova = 0, rec = 0, quit = 0;
+      for (const c of (q.clientes || [])) {
+        if (c.retorno !== "CREDITADO" || !c.cpf) continue;
+        quit += 1;
+        const ci = credInfo.get(c.cpf);
+        if (ci && ci.primeiroISO === refISO) nova += 1; else rec += 1;
+      }
+      return {
+        id: q.id, label: q.label, periodoIni: q.periodoIni, periodoFim: q.periodoFim,
+        dataPagamento: q.dataPagamento || "", valorCreditado: q.valorCreditado || 0,
+        quitadas: quit, novas: nova, recorrentes: rec,
+        estornos: (q.estornados || []).length,
+      };
+    });
+    const carteiraTotal = carteira.reduce((s, q) => s + (q.valorCreditado || 0), 0);
+    const aReceber = carteira.filter((q) => !q.dataPagamento).reduce((s, q) => s + (q.valorCreditado || 0), 0);
+    const estTotal = quinzenas.reduce((s, q) => s + (q.estornados || []).reduce((a, e) => a + (e.valor || 0), 0), 0);
+    const clientesCreditados = credInfo.size;       // CPFs distintos já creditados (carteira ativa)
+    const quitacoesTotal = [...credInfo.values()].reduce((s, c) => s + c.quitacoes, 0);
+    const ultimaQuinzena = carteira[carteira.length - 1] || null;
+
+    // Contadores de funil (nível CPF)
+    const uniq = [...ibByCpf.values()];
+    const aprovadasCpf = uniq.filter((v) => audByCpf.get(v.cpf)?.status === "APROVADA");
+    const funnel = {
+      fechamentosRegistros: ibridge.length,
+      clientesUnicos: uniq.length,
+      aprovadas: aprovadasCpf.length,
+      recusadas: uniq.filter((v) => audByCpf.get(v.cpf)?.status === "RECUSADA").length,
+      verificar: uniq.filter((v) => audByCpf.get(v.cpf)?.status === "VERIFICAR").length,
+      pendente: ibSemAud.length,
+      creditadas: aprovadasCpf.filter((v) => repByCpf.get(v.cpf)?.retorno === "CREDITADO").length,
+      naoEfetuado: aprovadasCpf.filter((v) => repByCpf.get(v.cpf)?.retorno === "NAO_EFETUADO").length,
+      cancelado: aprovadasCpf.filter((v) => repByCpf.get(v.cpf)?.retorno === "CANCELADO").length,
+      emTransito: aprovadasCpf.filter((v) => !repByCpf.has(v.cpf)).length,
+    };
+
+    /* ---------- Comissão GT por CAMPANHA ----------
+       A 1ª venda creditada do CPF usa a % "primeira" SE a entrada (fechamento iBridge)
+       estiver dentro do período da campanha; da 2ª em diante usa a % "recorrente".
+       Fora de campanha, vale a comissão padrão (comissaoPct). */
+    const creditadasPorCpf = new Map();
+    for (const v of enriched) {
+      if (v.statusCred !== "CREDITADO" || !v.cpf) continue;
+      const arr = creditadasPorCpf.get(v.cpf) || [];
+      arr.push(v); creditadasPorCpf.set(v.cpf, arr);
+    }
+    for (const arr of creditadasPorCpf.values()) {
+      arr.forEach((v) => {
+        const primeira = v.recorrencia === "NOVA";
+        const camp = campanhaDaData(campanhas, v.dataISO); // campanha pela data de ENTRADA
+        const rate = camp ? (primeira ? camp.pctPrimeira : camp.pctRecorrente) : comissaoPct;
+        v.creditPrimeira = primeira;
+        v.comissaoRate = rate;
+        v.comissaoValor = planoValor * rate;
+        v.campanhaNome = camp ? camp.nome : null;
+      });
+    }
+    const credList = enriched.filter((v) => v.statusCred === "CREDITADO");
+    const credPrimeiras = credList.filter((v) => v.creditPrimeira);
+    const credRecorr = credList.filter((v) => !v.creditPrimeira);
+    const soma = (arr) => arr.reduce((s, v) => s + (v.comissaoValor || 0), 0);
+    const comissao = {
+      total: soma(credList), primeira: soma(credPrimeiras), recorrente: soma(credRecorr),
+      qtdPrimeira: credPrimeiras.length, qtdRecorrente: credRecorr.length,
+    };
+    const comissaoRecorrenteMes = funnel.creditadas * planoValor * comissaoPct;
+    const receitaPorVenda = planoValor * comissaoPct;
+
+    const novas = enriched.filter((v) => v.recorrencia === "NOVA");
+    const recorrentes = enriched.filter((v) => v.recorrencia === "RECORRENTE");
+    const rec = {
+      novas: novas.length, recorrentes: recorrentes.length,
+      novasCreditadas: novas.filter((v) => v.statusCred === "CREDITADO").length,
+      recorrentesCreditadas: recorrentes.filter((v) => v.statusCred === "CREDITADO").length,
+    };
+
+    return {
+      enriched, audSemIb, ibSemAud, repSemAud, funnel,
+      audByCpf, repByCpf, ibByCpf, aprovadasCpf, credInfo,
+      temRepasses, carteira, carteiraTotal, aReceber, estTotal, clientesCreditados, quitacoesTotal, ultimaQuinzena,
+      repTotal: carteiraTotal, valorAReceber: aReceber, creditadosBanco: clientesCreditados,
+      receitaPorVenda, comissao, comissaoRecorrenteMes, rec,
+    };
+  }, [ibridge, auditoria, repasses, planoValor, comissaoPct, campanhas]);
+
+  const temDados = ibridge.length || auditoria.length || repasses.length;
+
+  // ----- Gate de autenticação -----
+  if (!booted) {
+    return <div className="grid min-h-screen place-items-center bg-slate-50 text-slate-400">Carregando…</div>;
+  }
+  if (!sessao) {
+    return <LoginView onLogin={doLogin} onDefinirSenha={definirSenha} />;
+  }
+
+  const isAdmin = sessao.papel === "admin";
+  const menusVisiveis = MENUS.filter((m) => sessao.menus?.[m.id] !== false && (m.id !== "usuarios" || isAdmin || sessao.menus?.usuarios));
+  const menuAtivo = menusVisiveis.some((m) => m.id === menu) ? menu : (menusVisiveis[0]?.id || "dashboard");
+
+  return (
+    <div className="flex min-h-screen w-full bg-slate-50 font-sans text-slate-900" style={{ fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif" }}>
+      {/* Sidebar */}
+      <aside className="sticky top-0 hidden h-screen w-60 flex-col border-r p-4 text-slate-300 md:flex" style={{ background: BRAND.ink, borderColor: "rgba(255,255,255,.08)" }}>
+        <div className="mb-6 px-1">
+          <CredGTLogo size={38} light />
+          <div className="mt-1.5 text-[11px] text-slate-400">Gestão de Vendas</div>
+        </div>
+        <nav className="flex flex-col gap-1">
+          {menusVisiveis.map((m) => {
+            const active = menuAtivo === m.id;
+            return (
+              <button key={m.id} onClick={() => setMenu(m.id)}
+                className="flex items-center gap-2.5 rounded-lg px-3 py-2 text-sm transition"
+                style={active ? { background: BRAND.blue, color: "#fff" } : { color: "#cbd5e1" }}
+                onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = "rgba(255,255,255,.06)"; }}
+                onMouseLeave={(e) => { if (!active) e.currentTarget.style.background = "transparent"; }}>
+                <m.icon size={17} /> {m.label}
+              </button>
+            );
+          })}
+        </nav>
+        <div className="mt-auto space-y-2">
+          <div className="rounded-lg p-3 text-[11px] text-slate-400" style={{ background: "rgba(255,255,255,.05)" }}>
+            <div className="flex items-center gap-1.5 text-slate-200"><Database size={12} /> Funil unificado por CPF</div>
+            <p className="mt-1 leading-relaxed">iBridge → Auditoria → Repasse. Dados salvos entre sessões.</p>
+          </div>
+          <div className="flex items-center justify-between rounded-lg px-3 py-2" style={{ background: "rgba(255,255,255,.05)" }}>
+            <div className="min-w-0">
+              <div className="truncate text-xs font-semibold text-white">{sessao.nome}</div>
+              <div className="text-[10px] uppercase tracking-wide text-slate-400">{sessao.papel}</div>
+            </div>
+            <button onClick={logout} title="Sair" className="grid h-8 w-8 place-items-center rounded-lg text-slate-300 hover:bg-white/10"><LogOut size={15} /></button>
+          </div>
+        </div>
+      </aside>
+
+      {/* Conteúdo */}
+      <main className="flex-1 overflow-x-hidden">
+        {/* Top bar mobile */}
+        <div className="flex items-center justify-between gap-2 border-b border-slate-200 bg-white px-3 py-2 md:hidden">
+          <CredGTLogo size={26} />
+          <button onClick={logout} className="flex items-center gap-1 rounded-lg px-2 py-1 text-xs text-slate-500"><LogOut size={13} /> Sair</button>
+        </div>
+        <div className="flex items-center gap-2 overflow-x-auto border-b border-slate-200 bg-white p-2 md:hidden">
+          {menusVisiveis.map((m) => (
+            <button key={m.id} onClick={() => setMenu(m.id)}
+              className="flex items-center gap-1.5 whitespace-nowrap rounded-lg px-3 py-1.5 text-xs"
+              style={menuAtivo === m.id ? { background: BRAND.blue, color: "#fff" } : { color: "#475569" }}>
+              <m.icon size={14} /> {m.label}
+            </button>
+          ))}
+        </div>
+
+        <div className="mx-auto max-w-7xl p-4 md:p-6">
+          {menuAtivo === "dashboard" && <DashboardView model={model} planoValor={planoValor} comissaoPct={comissaoPct} setConfig={updateConfig} temDados={temDados} go={setMenu} />}
+          {menuAtivo === "ibridge" && <IbridgeView model={model} ibridge={ibridge} onUpload={(f) => handleUpload(f, "ibridge")} onClear={() => clearKind("ibridge")} loading={loading === "ibridge"} />}
+          {menuAtivo === "auditadas" && <AuditadasView model={model} auditoria={auditoria} onUpload={(f) => handleUpload(f, "auditoria")} onClear={() => clearKind("auditoria")} loading={loading === "auditoria"} />}
+          {menuAtivo === "creditadas" && <CreditadasView model={model} repasses={repasses} lerQuinzena={lerQuinzena} onAdd={addQuinzena} onRemove={removeQuinzena} onClear={() => clearKind("repasse")} sessao={sessao} flash={flash} />}
+          {menuAtivo === "projecao" && <ProjecaoView model={model} planoValor={planoValor} comissaoPct={comissaoPct} campanhas={campanhas} />}
+          {menuAtivo === "campanhas" && <CampanhasView campanhas={campanhas} setCampanhas={persistCampanhas} planoValor={planoValor} comissaoPct={comissaoPct} setConfig={updateConfig} sessao={sessao} flash={flash} />}
+          {menuAtivo === "relatorios" && <RelatoriosView model={model} repasses={repasses} />}
+          {menuAtivo === "usuarios" && <UsuariosView users={users} setUsers={persistUsers} sessao={sessao} flash={flash} />}
+        </div>
+      </main>
+
+      {/* Toast */}
+      {toast && (
+        <div className={`fixed bottom-5 right-5 z-50 flex max-w-sm items-start gap-2 rounded-xl px-4 py-3 text-sm text-white shadow-lg ${toast.ok ? "bg-slate-900" : "bg-rose-600"}`}>
+          {toast.ok ? <CheckCircle2 size={18} /> : <AlertTriangle size={18} />}
+          <span>{toast.msg}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ====================== LOGIN ====================== */
+function LoginView({ onLogin, onDefinirSenha }) {
+  const [login, setLogin] = useState("");
+  const [senha, setSenha] = useState("");
+  const [erro, setErro] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [novoUser, setNovoUser] = useState(null); // primeiro acesso
+  const [s1, setS1] = useState(""); const [s2, setS2] = useState("");
+
+  const entrar = async () => {
+    setErro(""); setBusy(true);
+    const r = await onLogin(login, senha);
+    setBusy(false);
+    if (r.erro) return setErro(r.erro);
+    if (r.primeiroAcesso) { setNovoUser(r.primeiroAcesso); setS1(""); setS2(""); }
+  };
+  const criarSenha = async () => {
+    setErro("");
+    if (s1 !== s2) return setErro("As senhas não coincidem.");
+    setBusy(true);
+    const r = await onDefinirSenha(novoUser.id, s1);
+    setBusy(false);
+    if (r.erro) return setErro(r.erro);
+  };
+
+  return (
+    <div className="grid min-h-screen place-items-center p-4" style={{ background: `linear-gradient(135deg, ${BRAND.ink} 0%, ${BRAND.blueDeep} 100%)` }}>
+      <div className="w-full max-w-sm rounded-2xl bg-white p-7 shadow-2xl">
+        <div className="mb-6 flex flex-col items-center text-center">
+          <CredGTLogo size={64} />
+          <p className="mt-3 text-sm text-slate-500">Gestão de Vendas</p>
+        </div>
+
+        {!novoUser ? (
+          <div className="space-y-3">
+            <div>
+              <label className="mb-1 block text-xs font-medium text-slate-600">Usuário</label>
+              <input value={login} onChange={(e) => setLogin(e.target.value)} onKeyDown={(e) => e.key === "Enter" && entrar()}
+                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-400" placeholder="seu.usuario" autoFocus />
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-slate-600">Senha</label>
+              <input type="password" value={senha} onChange={(e) => setSenha(e.target.value)} onKeyDown={(e) => e.key === "Enter" && entrar()}
+                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-400" placeholder="••••••" />
+            </div>
+            {erro && <p className="flex items-center gap-1.5 text-xs text-rose-600"><AlertTriangle size={13} /> {erro}</p>}
+            <button onClick={entrar} disabled={busy}
+              className="mt-1 flex w-full items-center justify-center gap-2 rounded-lg py-2.5 text-sm font-semibold text-white disabled:opacity-60"
+              style={{ background: BRAND.blue }}>
+              <Lock size={15} /> {busy ? "Entrando…" : "Entrar"}
+            </button>
+            <p className="pt-1 text-center text-[11px] text-slate-400">Primeiro acesso? Use a senha inicial <b>123456</b> e crie sua senha de 6 dígitos.</p>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            <div className="rounded-lg bg-slate-50 p-3 text-center text-sm text-slate-600">
+              Olá, <b>{novoUser.nome.split(" ")[0]}</b>! Crie sua senha de acesso.
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-slate-600">Nova senha (6 dígitos)</label>
+              <input type="password" inputMode="numeric" maxLength={6} value={s1} onChange={(e) => setS1(e.target.value.replace(/\D/g, ""))}
+                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm tracking-[0.4em] outline-none focus:border-slate-400" placeholder="••••••" autoFocus />
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-slate-600">Confirme a senha</label>
+              <input type="password" inputMode="numeric" maxLength={6} value={s2} onChange={(e) => setS2(e.target.value.replace(/\D/g, ""))} onKeyDown={(e) => e.key === "Enter" && criarSenha()}
+                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm tracking-[0.4em] outline-none focus:border-slate-400" placeholder="••••••" />
+            </div>
+            {erro && <p className="flex items-center gap-1.5 text-xs text-rose-600"><AlertTriangle size={13} /> {erro}</p>}
+            <button onClick={criarSenha} disabled={busy}
+              className="flex w-full items-center justify-center gap-2 rounded-lg py-2.5 text-sm font-semibold text-white disabled:opacity-60" style={{ background: BRAND.blue }}>
+              <KeyRound size={15} /> {busy ? "Salvando…" : "Criar senha e entrar"}
+            </button>
+            <p className="text-center text-[11px] text-slate-400">A senha deve ser numérica, com 6 dígitos, e diferente das demais.</p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ====================== USUÁRIOS ====================== */
+function UsuariosView({ users, setUsers, sessao, flash }) {
+  const isAdmin = sessao.papel === "admin";
+  const [edit, setEdit] = useState(null); // user em edição (ou novo)
+  const [confirmDel, setConfirmDel] = useState(null);
+
+  const novo = () => setEdit({ id: "u_" + Date.now(), nome: "", email: "", login: "", senha: SENHA_INICIAL, precisaSenha: true, papel: "usuario", menus: menusAll(), _novo: true });
+  const salvar = async () => {
+    const e = edit;
+    if (!e.nome.trim() || !e.login.trim()) return flash("Nome e usuário são obrigatórios.", false);
+    const loginNorm = e.login.trim().toLowerCase();
+    if (users.some((u) => u.id !== e.id && u.login.toLowerCase() === loginNorm)) return flash("Já existe um usuário com esse login.", false);
+    const limpo = { ...e, login: loginNorm }; delete limpo._novo;
+    const lista = e._novo ? [...users, limpo] : users.map((u) => u.id === e.id ? limpo : u);
+    await setUsers(lista); setEdit(null);
+    flash(e._novo ? "Usuário incluído." : "Usuário atualizado.");
+  };
+  const excluir = async (u) => { await setUsers(users.filter((x) => x.id !== u.id)); setConfirmDel(null); flash("Usuário excluído."); };
+  const resetSenha = async (u) => { await setUsers(users.map((x) => x.id === u.id ? { ...x, senha: SENHA_INICIAL, precisaSenha: true } : x)); flash(`Senha de ${u.nome.split(" ")[0]} redefinida para 123456 (1º acesso).`); };
+
+  const countMenus = (u) => MENU_KEYS.filter((k) => u.menus?.[k]).length;
+
+  return (
+    <>
+      <PageHeader title="Usuários" desc="Controle de acesso ao Cred GT. A senha inicial é 123456 — no 1º acesso o usuário define uma senha numérica de 6 dígitos."
+        right={isAdmin && <button onClick={novo} className="flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-medium text-white" style={{ background: BRAND.blue }}><Plus size={15} /> Novo usuário</button>} />
+
+      {!isAdmin && <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-2.5 text-sm text-amber-800">Somente administradores podem incluir, editar ou excluir usuários.</div>}
+
+      <div className="overflow-hidden rounded-xl border border-slate-200 bg-white">
+        <table className="w-full text-sm">
+          <thead><tr className="border-b border-slate-200 bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+            <th className="px-4 py-2.5">Nome</th><th className="px-4 py-2.5">Usuário</th><th className="px-4 py-2.5">Perfil</th>
+            <th className="px-4 py-2.5">Menus</th><th className="px-4 py-2.5">Status</th><th className="px-4 py-2.5 text-right">Ações</th>
+          </tr></thead>
+          <tbody>
+            {users.map((u) => (
+              <tr key={u.id} className="border-b border-slate-50 last:border-0">
+                <td className="px-4 py-2.5"><div className="font-medium text-slate-800">{u.nome}</div><div className="text-xs text-slate-400">{u.email}</div></td>
+                <td className="px-4 py-2.5 text-slate-600">{u.login}</td>
+                <td className="px-4 py-2.5"><span className="rounded-full px-2 py-0.5 text-xs font-medium" style={{ background: u.papel === "admin" ? BRAND.mint : "#EEF2F6", color: u.papel === "admin" ? BRAND.blueDeep : "#475569" }}>{u.papel}</span></td>
+                <td className="px-4 py-2.5 text-slate-600">{countMenus(u)}/{MENU_KEYS.length}</td>
+                <td className="px-4 py-2.5">{u.precisaSenha ? <span className="text-xs text-amber-600">1º acesso pendente</span> : <span className="text-xs text-emerald-600">ativo</span>}</td>
+                <td className="px-4 py-2.5">
+                  {isAdmin && (
+                    <div className="flex items-center justify-end gap-1">
+                      <button onClick={() => setEdit({ ...u })} title="Editar" className="grid h-8 w-8 place-items-center rounded-lg text-slate-500 hover:bg-slate-100"><Pencil size={14} /></button>
+                      <button onClick={() => resetSenha(u)} title="Redefinir senha" className="grid h-8 w-8 place-items-center rounded-lg text-slate-500 hover:bg-slate-100"><KeyRound size={14} /></button>
+                      {u.id !== sessao.id && <button onClick={() => setConfirmDel(u)} title="Excluir" className="grid h-8 w-8 place-items-center rounded-lg text-rose-500 hover:bg-rose-50"><Trash2 size={14} /></button>}
+                    </div>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {/* Modal de edição */}
+      {edit && (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4" onClick={() => setEdit(null)}>
+          <div className="w-full max-w-lg rounded-2xl bg-white p-5 shadow-xl" onClick={(e) => e.stopPropagation()}>
+            <div className="mb-4 flex items-center justify-between">
+              <h3 className="text-base font-semibold text-slate-800">{edit._novo ? "Novo usuário" : "Editar usuário"}</h3>
+              <button onClick={() => setEdit(null)} className="text-slate-400 hover:text-slate-600"><X size={18} /></button>
+            </div>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <Field label="Nome completo"><input value={edit.nome} onChange={(e) => setEdit({ ...edit, nome: e.target.value })} className="inp" /></Field>
+              <Field label="E-mail"><input value={edit.email} onChange={(e) => setEdit({ ...edit, email: e.target.value })} className="inp" /></Field>
+              <Field label="Usuário (login)"><input value={edit.login} onChange={(e) => setEdit({ ...edit, login: e.target.value })} className="inp" /></Field>
+              <Field label="Perfil">
+                <select value={edit.papel} onChange={(e) => setEdit({ ...edit, papel: e.target.value })} className="inp">
+                  <option value="admin">admin</option><option value="usuario">usuario</option>
+                </select>
+              </Field>
+            </div>
+            <div className="mt-4">
+              <div className="mb-1.5 flex items-center justify-between">
+                <label className="text-xs font-medium text-slate-600">Acesso aos menus</label>
+                <div className="flex gap-2 text-[11px]">
+                  <button onClick={() => setEdit({ ...edit, menus: menusAll() })} className="text-slate-500 hover:underline">Marcar todos</button>
+                  <button onClick={() => setEdit({ ...edit, menus: menusFrom([]) })} className="text-slate-500 hover:underline">Limpar</button>
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-1.5 rounded-lg border border-slate-200 p-3 sm:grid-cols-3">
+                {MENU_DEFS.map(([k, label]) => (
+                  <label key={k} className="flex items-center gap-2 text-sm text-slate-600">
+                    <input type="checkbox" checked={!!edit.menus?.[k]} onChange={(e) => setEdit({ ...edit, menus: { ...edit.menus, [k]: e.target.checked } })} />
+                    {label}
+                  </label>
+                ))}
+              </div>
+            </div>
+            <div className="mt-3 rounded-lg bg-slate-50 px-3 py-2 text-[11px] text-slate-500">
+              {edit._novo ? "O usuário entrará com a senha inicial 123456 e definirá a própria senha no 1º acesso." : "Para zerar a senha, use o botão da chave na listagem (volta para 123456)."}
+            </div>
+            <div className="mt-4 flex justify-end gap-2">
+              <button onClick={() => setEdit(null)} className="rounded-lg px-4 py-2 text-sm text-slate-600 hover:bg-slate-100">Cancelar</button>
+              <button onClick={salvar} className="flex items-center gap-1.5 rounded-lg px-4 py-2 text-sm font-semibold text-white" style={{ background: BRAND.blue }}><Check size={15} /> Salvar</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Confirmação de exclusão */}
+      {confirmDel && (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4" onClick={() => setConfirmDel(null)}>
+          <div className="w-full max-w-sm rounded-2xl bg-white p-5 shadow-xl" onClick={(e) => e.stopPropagation()}>
+            <h3 className="text-base font-semibold text-slate-800">Excluir usuário</h3>
+            <p className="mt-2 text-sm text-slate-600">Remover <b>{confirmDel.nome}</b>? Essa ação não pode ser desfeita.</p>
+            <div className="mt-4 flex justify-end gap-2">
+              <button onClick={() => setConfirmDel(null)} className="rounded-lg px-4 py-2 text-sm text-slate-600 hover:bg-slate-100">Cancelar</button>
+              <button onClick={() => excluir(confirmDel)} className="rounded-lg bg-rose-600 px-4 py-2 text-sm font-semibold text-white">Excluir</button>
+            </div>
+          </div>
+        </div>
+      )}
+      <style>{`.inp{width:100%;border:1px solid #cbd5e1;border-radius:.5rem;padding:.5rem .75rem;font-size:.875rem;outline:none}.inp:focus{border-color:#94a3b8}`}</style>
+    </>
+  );
+}
+function Field({ label, children }) {
+  return <div><label className="mb-1 block text-xs font-medium text-slate-600">{label}</label>{children}</div>;
+}
+
+/* ====================== CAMPANHAS ====================== */
+function CampanhasView({ campanhas, setCampanhas, planoValor, comissaoPct, setConfig, sessao, flash }) {
+  const isAdmin = sessao.papel === "admin";
+  const [edit, setEdit] = useState(null);
+  const [confirmDel, setConfirmDel] = useState(null);
+  const [vProd, setVProd] = useState(planoValor);
+  const [vPad, setVPad] = useState(Math.round(comissaoPct * 100));
+
+  const hoje = new Date().toISOString().slice(0, 10);
+  const novo = () => setEdit({ id: "camp_" + Date.now(), nome: "", ativa: true, inicio: hoje, fim: "", pctPrimeira: 0.50, pctRecorrente: 0.30, vantagem: "", _novo: true });
+  const salvar = async () => {
+    const e = edit;
+    if (!e.nome.trim()) return flash("Dê um nome à campanha.", false);
+    const limpo = { ...e }; delete limpo._novo;
+    const lista = e._novo ? [...campanhas, limpo] : campanhas.map((c) => c.id === e.id ? limpo : c);
+    await setCampanhas(lista); setEdit(null);
+    flash(e._novo ? "Campanha criada." : "Campanha atualizada.");
+  };
+  const excluir = async (c) => { await setCampanhas(campanhas.filter((x) => x.id !== c.id)); setConfirmDel(null); flash("Campanha excluída."); };
+  const toggleAtiva = async (c) => { await setCampanhas(campanhas.map((x) => x.id === c.id ? { ...x, ativa: !x.ativa } : x)); };
+  const salvarProduto = async () => { await setConfig({ planoValor: vProd, comissaoPct: (vPad || 0) / 100 }); flash("Valor do produto e comissão padrão atualizados."); };
+
+  const pct = (n) => `${Math.round((n || 0) * 100)}%`;
+  const cobre = (c) => c.ativa && (!c.inicio || hoje >= c.inicio) && (!c.fim || hoje <= c.fim);
+
+  return (
+    <>
+      <PageHeader title="Campanhas" desc="Cadastre o valor do produto e as campanhas do parceiro. As regras de comissão por período são aplicadas automaticamente nas vendas creditadas." />
+
+      {/* Valor do produto + comissão padrão */}
+      <div className="mb-5 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+        <div className="flex items-center gap-2 text-sm font-semibold text-slate-800"><Coins size={16} style={{ color: BRAND.blue }} /> Valor do produto e comissão padrão</div>
+        <p className="mt-1 text-xs text-slate-500">Se houver reajuste do plano, altere aqui — o sistema recalcula tudo, sem precisar reprogramar.</p>
+        <div className="mt-4 flex flex-wrap items-end gap-4">
+          <div>
+            <label className="mb-1 block text-xs font-medium text-slate-600">Valor do produto (R$)</label>
+            <input type="number" step="0.01" value={vProd} onChange={(e) => setVProd(parseFloat(e.target.value) || 0)} disabled={!isAdmin}
+              className="w-36 rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-400 disabled:bg-slate-50" />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs font-medium text-slate-600">Comissão padrão (%)</label>
+            <input type="number" step="1" value={vPad} onChange={(e) => setVPad(parseFloat(e.target.value) || 0)} disabled={!isAdmin}
+              className="w-28 rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-400 disabled:bg-slate-50" />
+            <p className="mt-1 text-[11px] text-slate-400">Vale fora de campanha</p>
+          </div>
+          <div className="rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-500">
+            Comissão padrão por venda: <b className="text-slate-700">{fmtBRL((vProd || 0) * (vPad || 0) / 100)}</b>
+          </div>
+          {isAdmin && <button onClick={salvarProduto} className="ml-auto flex items-center gap-1.5 rounded-lg px-4 py-2 text-sm font-semibold text-white" style={{ background: BRAND.blue }}><Check size={15} /> Salvar</button>}
+        </div>
+      </div>
+
+      <div className="mb-4 flex items-center justify-between">
+        <h2 className="text-base font-semibold text-slate-800">Campanhas cadastradas</h2>
+        {isAdmin && <button onClick={novo} className="flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-medium text-white" style={{ background: BRAND.blue }}><Plus size={15} /> Nova campanha</button>}
+      </div>
+      {campanhas.length === 0 ? (
+        <EmptyState icon={Megaphone} title="Nenhuma campanha cadastrada" desc="Crie uma campanha definindo período e as % de comissão da 1ª venda e da recorrência." />
+      ) : (
+        <div className="grid gap-4 md:grid-cols-2">
+          {campanhas.map((c) => (
+            <div key={c.id} className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="grid h-9 w-9 place-items-center rounded-lg" style={{ background: BRAND.mint, color: BRAND.blueDeep }}><Megaphone size={17} /></span>
+                    <div>
+                      <div className="font-semibold text-slate-800">{c.nome}</div>
+                      <div className="text-xs text-slate-500">{c.inicio ? brFromISO(c.inicio) : "—"} → {c.fim ? brFromISO(c.fim) : "sem fim"}</div>
+                    </div>
+                  </div>
+                </div>
+                <span className="rounded-full px-2 py-0.5 text-[11px] font-medium" style={cobre(c) ? { background: "#DCFCE7", color: "#15803D" } : c.ativa ? { background: "#FEF3C7", color: "#92400E" } : { background: "#F1F5F9", color: "#64748B" }}>
+                  {cobre(c) ? "Vigente" : c.ativa ? "Ativa (fora do período)" : "Inativa"}
+                </span>
+              </div>
+
+              <div className="mt-4 grid grid-cols-2 gap-2">
+                <div className="rounded-lg p-3" style={{ background: "#EAF3FA" }}>
+                  <div className="text-[11px] font-medium uppercase tracking-wide" style={{ color: BRAND.blueDeep }}>1ª venda creditada</div>
+                  <div className="mt-0.5 text-lg font-bold" style={{ color: BRAND.blueDeep }}>{pct(c.pctPrimeira)}</div>
+                  <div className="text-[11px] text-slate-500">{fmtBRL(planoValor * c.pctPrimeira)} por venda</div>
+                </div>
+                <div className="rounded-lg bg-violet-50 p-3">
+                  <div className="text-[11px] font-medium uppercase tracking-wide text-violet-700">Recorrência (2ª+)</div>
+                  <div className="mt-0.5 text-lg font-bold text-violet-700">{pct(c.pctRecorrente)}</div>
+                  <div className="text-[11px] text-slate-500">{fmtBRL(planoValor * c.pctRecorrente)} por venda</div>
+                </div>
+              </div>
+
+              {c.vantagem && <p className="mt-3 rounded-lg bg-slate-50 p-3 text-xs leading-relaxed text-slate-600">{c.vantagem}</p>}
+
+              {isAdmin && (
+                <div className="mt-4 flex items-center gap-2 border-t border-slate-100 pt-3">
+                  <button onClick={() => setEdit({ ...c })} className="flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs text-slate-600 hover:bg-slate-100"><Pencil size={13} /> Editar</button>
+                  <button onClick={() => toggleAtiva(c)} className="flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs text-slate-600 hover:bg-slate-100">{c.ativa ? "Desativar" : "Ativar"}</button>
+                  <button onClick={() => setConfirmDel(c)} className="ml-auto flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs text-rose-600 hover:bg-rose-50"><Trash2 size={13} /> Excluir</button>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Modal edição de campanha */}
+      {edit && (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4" onClick={() => setEdit(null)}>
+          <div className="w-full max-w-lg rounded-2xl bg-white p-5 shadow-xl" onClick={(e) => e.stopPropagation()}>
+            <div className="mb-4 flex items-center justify-between">
+              <h3 className="text-base font-semibold text-slate-800">{edit._novo ? "Nova campanha" : "Editar campanha"}</h3>
+              <button onClick={() => setEdit(null)} className="text-slate-400 hover:text-slate-600"><X size={18} /></button>
+            </div>
+            <div className="space-y-3">
+              <Field label="Nome da campanha"><input value={edit.nome} onChange={(e) => setEdit({ ...edit, nome: e.target.value })} className="inp" placeholder="Ex.: Campanha Sempre Odonto 2026" /></Field>
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="Início"><input type="date" value={edit.inicio} onChange={(e) => setEdit({ ...edit, inicio: e.target.value })} className="inp" /></Field>
+                <Field label="Fim"><input type="date" value={edit.fim} onChange={(e) => setEdit({ ...edit, fim: e.target.value })} className="inp" /></Field>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="% 1ª venda creditada"><input type="number" step="1" value={Math.round(edit.pctPrimeira * 100)} onChange={(e) => setEdit({ ...edit, pctPrimeira: (parseFloat(e.target.value) || 0) / 100 })} className="inp" /></Field>
+                <Field label="% recorrência (2ª+)"><input type="number" step="1" value={Math.round(edit.pctRecorrente * 100)} onChange={(e) => setEdit({ ...edit, pctRecorrente: (parseFloat(e.target.value) || 0) / 100 })} className="inp" /></Field>
+              </div>
+              <Field label="Vantagem para o parceiro (detalhe a campanha)">
+                <textarea rows={3} value={edit.vantagem} onChange={(e) => setEdit({ ...edit, vantagem: e.target.value })} className="inp" placeholder="Descreva o benefício, o período e as condições da campanha." />
+              </Field>
+              <label className="flex items-center gap-2 text-sm text-slate-600">
+                <input type="checkbox" checked={edit.ativa} onChange={(e) => setEdit({ ...edit, ativa: e.target.checked })} /> Campanha ativa
+              </label>
+            </div>
+            <div className="mt-4 flex justify-end gap-2">
+              <button onClick={() => setEdit(null)} className="rounded-lg px-4 py-2 text-sm text-slate-600 hover:bg-slate-100">Cancelar</button>
+              <button onClick={salvar} className="flex items-center gap-1.5 rounded-lg px-4 py-2 text-sm font-semibold text-white" style={{ background: BRAND.blue }}><Check size={15} /> Salvar</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {confirmDel && (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4" onClick={() => setConfirmDel(null)}>
+          <div className="w-full max-w-sm rounded-2xl bg-white p-5 shadow-xl" onClick={(e) => e.stopPropagation()}>
+            <h3 className="text-base font-semibold text-slate-800">Excluir campanha</h3>
+            <p className="mt-2 text-sm text-slate-600">Remover <b>{confirmDel.nome}</b>?</p>
+            <div className="mt-4 flex justify-end gap-2">
+              <button onClick={() => setConfirmDel(null)} className="rounded-lg px-4 py-2 text-sm text-slate-600 hover:bg-slate-100">Cancelar</button>
+              <button onClick={() => excluir(confirmDel)} className="rounded-lg bg-rose-600 px-4 py-2 text-sm font-semibold text-white">Excluir</button>
+            </div>
+          </div>
+        </div>
+      )}
+      <style>{`.inp{width:100%;border:1px solid #cbd5e1;border-radius:.5rem;padding:.5rem .75rem;font-size:.875rem;outline:none}.inp:focus{border-color:#94a3b8}`}</style>
+    </>
+  );
+}
+
+/* ====================== VIEWS ====================== */
+
+function PageHeader({ title, desc, right }) {
+  return (
+    <div className="mb-5 flex flex-wrap items-end justify-between gap-3">
+      <div>
+        <h1 className="text-xl font-semibold text-slate-900">{title}</h1>
+        {desc && <p className="mt-1 text-sm text-slate-500">{desc}</p>}
+      </div>
+      {right}
+    </div>
+  );
+}
+
+function EmptyState({ icon: Icon, title, desc, action }) {
+  return (
+    <div className="grid place-items-center rounded-xl border border-dashed border-slate-300 bg-white py-16 text-center">
+      <span className="mb-3 grid h-12 w-12 place-items-center rounded-full bg-slate-100 text-slate-400"><Icon size={22} /></span>
+      <h3 className="text-sm font-semibold text-slate-700">{title}</h3>
+      <p className="mt-1 max-w-sm text-sm text-slate-500">{desc}</p>
+      {action}
+    </div>
+  );
+}
+
+/* ---------- Dashboard ---------- */
+function DashboardView({ model, planoValor, comissaoPct, setConfig, temDados, go }) {
+  const f = model.funnel;
+  const taxaAprov = f.clientesUnicos ? f.aprovadas / f.clientesUnicos : 0;
+  const taxaCred = f.aprovadas ? f.creditadas / f.aprovadas : 0;
+  const taxaGlobal = f.clientesUnicos ? f.creditadas / f.clientesUnicos : 0;
+
+  // Vendas por dia (fechamentos)
+  const porDia = useMemo(() => {
+    const m = new Map();
+    for (const v of model.enriched) {
+      if (!v.dataISO) continue;
+      m.set(v.dataISO, (m.get(v.dataISO) || 0) + 1);
+    }
+    return [...m.entries()].sort().map(([iso, n]) => ({ dia: brFromISO(iso).slice(0, 5), fechamentos: n }));
+  }, [model]);
+
+  // Top operadores por aprovação
+  const porOperador = useMemo(() => {
+    const m = new Map();
+    for (const v of model.enriched) {
+      const k = v.operador || "—";
+      const o = m.get(k) || { operador: k, total: 0, aprovadas: 0 };
+      o.total++; if (v.statusAud === "APROVADA") o.aprovadas++;
+      m.set(k, o);
+    }
+    return [...m.values()].sort((a, b) => b.total - a.total).slice(0, 8);
+  }, [model]);
+
+  const retornoPie = useMemo(() => {
+    const m = new Map();
+    for (const c of model.repByCpf.values()) {
+      const t = STATUS_THEME[c.retorno]?.label || c.retorno;
+      m.set(t, (m.get(t) || 0) + 1);
+    }
+    return [...m.entries()].map(([name, value]) => ({ name, value }));
+  }, [model]);
+
+  if (!temDados) {
+    return (
+      <>
+        <PageHeader title="Dashboard" desc="Visão geral do funil de vendas Cred GT." />
+        <EmptyState icon={LayoutDashboard} title="Comece enviando as planilhas"
+          desc="Suba a planilha do iBridge para iniciar. Depois, a Auditoria e o Repasse — o funil é montado automaticamente pelo CPF."
+          action={<button onClick={() => go("ibridge")} className="mt-4 rounded-lg px-4 py-2 text-sm font-medium text-white" style={{ background: BRAND.blue }}>Ir para Vendas iBridge</button>} />
+      </>
+    );
+  }
+
+  return (
+    <>
+      <PageHeader title="Dashboard" desc="Funil completo: do fechamento no call center até o crédito em conta."
+        right={
+          <div className="flex flex-wrap items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm">
+            <span className="text-slate-500">Valor plano (R$)</span>
+            <input type="number" step="0.01" value={planoValor}
+              onChange={(e) => setConfig({ planoValor: parseFloat(e.target.value) || 0 })}
+              className="w-20 rounded border border-slate-200 px-2 py-1 text-right outline-none focus:border-slate-400" />
+            <span className="ml-2 text-slate-500">Comissão GT (%)</span>
+            <input type="number" step="1" value={Math.round(comissaoPct * 100)}
+              onChange={(e) => setConfig({ comissaoPct: (parseFloat(e.target.value) || 0) / 100 })}
+              className="w-16 rounded border border-slate-200 px-2 py-1 text-right outline-none focus:border-slate-400" />
+          </div>
+        } />
+
+      {/* KPIs */}
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <Kpi icon={Phone} tone="sky" label="Fechamentos iBridge" value={fmtInt(f.fechamentosRegistros)} sub={`${fmtInt(f.clientesUnicos)} clientes únicos`} />
+        <Kpi icon={ShieldCheck} tone="emerald" label="Aprovadas auditoria" value={fmtInt(f.aprovadas)} sub={`Aprovação ${fmtPct(taxaAprov)}`} />
+        <Kpi icon={CreditCard} tone="violet" label="Creditadas (vidas)" value={fmtInt(f.creditadas)} sub={`Conversão venda→crédito ${fmtPct(taxaGlobal)}`} />
+        <Kpi icon={Wallet} tone="emerald" label="Carteira (repasse total)" value={fmtBRL(model.carteiraTotal)} sub={`${fmtInt(model.carteira.length)} quinzenas`} />
+      </div>
+      <div className="mt-3 grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <Kpi icon={XCircle} tone="rose" label="Recusadas auditoria" value={fmtInt(f.recusadas)} />
+        <Kpi icon={AlertTriangle} tone="amber" label="A verificar" value={fmtInt(f.verificar + f.pendente)} sub={`${fmtInt(f.pendente)} sem auditoria`} />
+        <Kpi icon={Clock} tone="sky" label="Em trânsito (aprovadas s/ crédito)" value={fmtInt(f.emTransito)} />
+        <Kpi icon={Trash2} tone="rose" label="Estornos" value={fmtInt(model.carteira.reduce((s, q) => s + q.estornos, 0))} sub={fmtBRL(model.estTotal)} />
+      </div>
+
+      {/* Comissão GT por campanha + regime recorrente */}
+      <div className="mt-3 grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <Kpi icon={Coins} tone="teal" label="Comissão total creditada" value={fmtBRL(model.comissao.total)} sub={`${fmtInt(f.creditadas)} vendas creditadas`} />
+        <Kpi icon={Plus} tone="blue" label="Comissão 1ª venda" value={fmtBRL(model.comissao.primeira)} sub={`${fmtInt(model.comissao.qtdPrimeira)} primeiras`} />
+        <Kpi icon={Repeat} tone="violet" label="Comissão recorrente" value={fmtBRL(model.comissao.recorrente)} sub={`${fmtInt(model.comissao.qtdRecorrente)} recorrentes`} />
+        <Kpi icon={Wallet} tone="emerald" label="Recorrente / mês (regime)" value={fmtBRL(model.comissaoRecorrenteMes)} sub={`${Math.round(comissaoPct * 100)}% × ${fmtInt(f.creditadas)} ativos`} />
+      </div>
+
+      {/* Funil visual */}
+      <div className="mt-5 grid gap-4 lg:grid-cols-3">
+        <div className="lg:col-span-2 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+          <SectionTitle>Funil de conversão</SectionTitle>
+          <FunnelBars steps={[
+            { label: "Fechamentos (clientes)", value: f.clientesUnicos, tone: "bg-sky-500" },
+            { label: "Aprovadas na auditoria", value: f.aprovadas, tone: "bg-teal-500" },
+            { label: "Enviadas ao banco (aprovadas)", value: f.aprovadas, tone: "bg-violet-500" },
+            { label: "Creditadas (vidas)", value: f.creditadas, tone: "bg-emerald-500" },
+          ]} base={f.clientesUnicos} />
+          <div className="mt-4 grid grid-cols-3 gap-3 text-center">
+            <MiniStat label="Aprovação auditoria" value={fmtPct(taxaAprov)} />
+            <MiniStat label="Crédito s/ aprovadas" value={fmtPct(taxaCred)} />
+            <MiniStat label="Conversão global" value={fmtPct(taxaGlobal)} />
+          </div>
+        </div>
+        <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+          <SectionTitle>Retorno do banco</SectionTitle>
+          {retornoPie.length ? (
+            <ResponsiveContainer width="100%" height={240}>
+              <PieChart>
+                <Pie data={retornoPie} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={80} label={(e) => e.value}>
+                  {retornoPie.map((_, i) => <Cell key={i} fill={CHART_COLORS[i % CHART_COLORS.length]} />)}
+                </Pie>
+                <Tooltip /><Legend wrapperStyle={{ fontSize: 11 }} />
+              </PieChart>
+            </ResponsiveContainer>
+          ) : <p className="py-10 text-center text-sm text-slate-400">Envie o Repasse para ver os retornos.</p>}
+        </div>
+      </div>
+
+      {/* Charts */}
+      <div className="mt-4 grid gap-4 lg:grid-cols-2">
+        <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+          <SectionTitle>Fechamentos por dia</SectionTitle>
+          <ResponsiveContainer width="100%" height={240}>
+            <LineChart data={porDia}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#eef2f7" />
+              <XAxis dataKey="dia" tick={{ fontSize: 11 }} /><YAxis tick={{ fontSize: 11 }} />
+              <Tooltip /><Line type="monotone" dataKey="fechamentos" stroke="#0284c7" strokeWidth={2} dot={false} />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+        <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+          <SectionTitle>Top operadores (total × aprovadas)</SectionTitle>
+          <ResponsiveContainer width="100%" height={240}>
+            <BarChart data={porOperador}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#eef2f7" />
+              <XAxis dataKey="operador" tick={{ fontSize: 10 }} interval={0} angle={-20} textAnchor="end" height={60} />
+              <YAxis tick={{ fontSize: 11 }} /><Tooltip /><Legend wrapperStyle={{ fontSize: 11 }} />
+              <Bar dataKey="total" fill="#cbd5e1" name="Total" radius={[3, 3, 0, 0]} />
+              <Bar dataKey="aprovadas" fill="#0f766e" name="Aprovadas" radius={[3, 3, 0, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function FunnelBars({ steps, base }) {
+  return (
+    <div className="space-y-2.5">
+      {steps.map((s, i) => {
+        const pct = base ? (s.value / base) * 100 : 0;
+        return (
+          <div key={i}>
+            <div className="mb-1 flex items-center justify-between text-xs">
+              <span className="text-slate-600">{s.label}</span>
+              <span className="font-medium text-slate-800">{fmtInt(s.value)} · {pct.toFixed(1)}%</span>
+            </div>
+            <div className="h-7 w-full overflow-hidden rounded-md bg-slate-100">
+              <div className={`flex h-full items-center rounded-md ${s.tone} transition-all`} style={{ width: `${Math.max(pct, 2)}%` }} />
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+function MiniStat({ label, value }) {
+  return (
+    <div className="rounded-lg bg-slate-50 p-3">
+      <div className="text-lg font-semibold text-slate-900">{value}</div>
+      <div className="text-[11px] text-slate-500">{label}</div>
+    </div>
+  );
+}
+
+/* ---------- Quadro de funil compartilhado (iBridge / Auditadas / Creditadas) ---------- */
+function RecBadge({ tipo }) {
+  const nova = tipo === "NOVA";
+  return <span className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium ring-1 ring-inset"
+    style={nova ? { background: "#EAF3FA", color: BRAND.blueDeep, boxShadow: "inset 0 0 0 1px " + BRAND.tealLt }
+                : { background: "#F3EEFB", color: "#6D28D9", boxShadow: "inset 0 0 0 1px #DDD6FE" }}>
+    {nova ? <Plus size={11} /> : <Repeat size={11} />}{nova ? "1ª venda" : "Recorrente"}
+  </span>;
+}
+
+function FunilPanel({ model }) {
+  // Filtro de período: mês atual / mês específico / intervalo / todas
+  const [periodo, setPeriodo] = useState("todas");
+  const [mesSel, setMesSel] = useState(mesAtualISO());
+  const [de, setDe] = useState(""); const [ate, setAte] = useState("");
+
+  const meses = useMemo(() => {
+    const s = new Set(model.enriched.map((v) => v.mesISO).filter(Boolean));
+    return [...s].sort().reverse();
+  }, [model]);
+
+  const noPeriodo = (v) => {
+    if (periodo === "todas") return true;
+    if (!v.dataISO) return false;
+    if (periodo === "atual") return v.mesISO === mesAtualISO();
+    if (periodo === "mes") return v.mesISO === mesSel;
+    if (periodo === "intervalo") return (!de || v.dataISO >= de) && (!ate || v.dataISO <= ate);
+    return true;
+  };
+
+  const rows = useMemo(() => model.enriched.filter(noPeriodo), [model, periodo, mesSel, de, ate]);
+  const operadores = [...new Set(rows.map((v) => v.operador).filter(Boolean))].sort();
+
+  const k = useMemo(() => {
+    const cpfs = new Set(rows.map((r) => r.cpf).filter(Boolean));
+    return {
+      fechamentos: rows.length,
+      unicos: cpfs.size,
+      novas: rows.filter((r) => r.recorrencia === "NOVA").length,
+      recorrentes: rows.filter((r) => r.recorrencia === "RECORRENTE").length,
+      aprovadas: rows.filter((r) => r.statusAud === "APROVADA").length,
+      creditadas: rows.filter((r) => r.statusCred === "CREDITADO").length,
+      semAud: rows.filter((r) => r.statusAud === "PENDENTE").length,
+    };
+  }, [rows]);
+  const comissaoRecorte = rows.reduce((s, r) => s + (r.statusCred === "CREDITADO" ? (r.comissaoValor || 0) : 0), 0);
+
+  const btn = (id, label) => (
+    <button onClick={() => setPeriodo(id)} className="rounded-lg px-3 py-1.5 text-xs font-medium transition"
+      style={periodo === id ? { background: BRAND.blue, color: "#fff" } : { background: "#EEF2F6", color: "#475569" }}>{label}</button>
+  );
+
+  return (
+    <>
+      {/* Barra de período */}
+      <div className="mb-4 flex flex-wrap items-center gap-2 rounded-xl border border-slate-200 bg-white p-3">
+        <span className="flex items-center gap-1.5 text-xs font-semibold text-slate-500"><Calendar size={14} /> Período:</span>
+        {btn("atual", "Mês atual")}
+        {btn("mes", "Mês específico")}
+        {btn("intervalo", "Intervalo")}
+        {btn("todas", "Todas as vendas")}
+        {periodo === "mes" && (
+          <select value={mesSel} onChange={(e) => setMesSel(e.target.value)} className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs">
+            {(meses.length ? meses : [mesAtualISO()]).map((m) => <option key={m} value={m}>{labelMes(m)}</option>)}
+          </select>
+        )}
+        {periodo === "intervalo" && (
+          <span className="flex items-center gap-1.5 text-xs text-slate-500">
+            <input type="date" value={de} onChange={(e) => setDe(e.target.value)} className="rounded-lg border border-slate-300 px-2 py-1 text-xs" />
+            até
+            <input type="date" value={ate} onChange={(e) => setAte(e.target.value)} className="rounded-lg border border-slate-300 px-2 py-1 text-xs" />
+          </span>
+        )}
+        <span className="ml-auto text-xs text-slate-400">{fmtInt(k.fechamentos)} fechamentos no recorte</span>
+      </div>
+
+      {/* KPIs do recorte */}
+      <div className="mb-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <Kpi icon={Phone} tone="sky" label="Fechamentos" value={fmtInt(k.fechamentos)} sub={`${fmtInt(k.unicos)} CPFs únicos`} />
+        <Kpi icon={Plus} tone="blue" label="1ª venda" value={fmtInt(k.novas)} />
+        <Kpi icon={Repeat} tone="violet" label="Recorrentes" value={fmtInt(k.recorrentes)} sub="após 1º crédito" />
+        <Kpi icon={AlertTriangle} tone="amber" label="Sem auditoria" value={fmtInt(k.semAud)} />
+      </div>
+      <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-3">
+        <Kpi icon={CheckCircle2} tone="emerald" label="Aprovadas" value={fmtInt(k.aprovadas)} />
+        <Kpi icon={CreditCard} tone="emerald" label="Creditadas" value={fmtInt(k.creditadas)} />
+        <Kpi icon={Coins} tone="teal" label="Comissão GT no recorte" value={fmtBRL(comissaoRecorte)} sub="conforme campanha vigente" />
+      </div>
+
+      <DataTable
+        rows={rows}
+        searchKeys={["nome", "cpf"]}
+        filters={[
+          { key: "recorrencia", label: "Tipo", options: ["NOVA", "RECORRENTE"] },
+          { key: "statusAud", label: "Auditoria", options: ["APROVADA", "RECUSADA", "VERIFICAR", "PENDENTE"] },
+          { key: "statusCred", label: "1º Crédito", options: ["CREDITADO", "NAO_EFETUADO", "CANCELADO", "EM_TRANSITO"] },
+          { key: "operador", label: "Operador", options: operadores },
+        ]}
+        columns={[
+          { key: "dataBR", title: "Data", render: (r) => <span>{r.dataBR} <span className="text-slate-400">{r.hora}</span></span> },
+          { key: "nome", title: "Cliente", render: (r) => <span className="font-medium text-slate-800">{r.nome || "—"}</span> },
+          { key: "cpf", title: "CPF", render: (r) => r.cpf || "—" },
+          { key: "recorrencia", title: "Tipo", render: (r) => <RecBadge tipo={r.recorrencia} /> },
+          { key: "operador", title: "Operador" },
+          { key: "statusAud", title: "Auditoria", render: (r) => <Badge status={r.statusAud} /> },
+          { key: "statusCred", title: "1º Crédito", render: (r) => r.statusCred ? <Badge status={r.statusCred} /> : <span className="text-slate-300">—</span> },
+        ]}
+      />
+    </>
+  );
+}
+
+/* ---------- Vendas iBridge ---------- */
+function IbridgeView({ model, ibridge, onUpload, onClear, loading }) {
+  return (
+    <>
+      <PageHeader title="Vendas iBridge" desc="Etapa 1 do funil — fechamentos do call center. Os uploads se acumulam (sem duplicar) e você filtra por período." />
+      <div className="mb-4">
+        <UploadCard title="Planilha de vendas iBridge (panorama)" hint="Cada upload ACUMULA com os anteriores · Operação, Equipe, Operador, Data, Código (CPF), Contato… · .xlsx ou .csv"
+          accept=".xlsx,.xls,.csv" onFile={onUpload} count={ibridge.length} onClear={onClear} loading={loading} />
+      </div>
+      {ibridge.length === 0
+        ? <EmptyState icon={Phone} title="Nenhuma venda iBridge importada" desc="Envie a planilha de fechamentos do dia ou do período para iniciar o funil. Os próximos uploads serão somados a este." />
+        : <FunilPanel model={model} />}
+    </>
+  );
+}
+
+/* ---------- Vendas Auditadas ---------- */
+function AuditadasView({ model, auditoria, onUpload, onClear, loading }) {
+  const motivosTop = useMemo(() => {
+    const m = new Map();
+    for (const a of auditoria) {
+      if (a.status !== "RECUSADA" || !a.motivo) continue;
+      const key = a.motivo.slice(0, 60);
+      m.set(key, (m.get(key) || 0) + 1);
+    }
+    return [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6);
+  }, [auditoria]);
+
+  return (
+    <>
+      <PageHeader title="Vendas Auditadas" desc="Etapa 2 — conferência das ligações. O mesmo quadro do funil, agora com a coluna Auditoria classificada linha a linha." />
+      <div className="mb-4">
+        <UploadCard title="Planilha Auditoria GT 2" hint="Modelo: DATA, CPF, NOME, PARCEIRO, ELEGÍVEL (Sim/Não), OPERADOR, MOTIVO · .xlsx ou .csv"
+          accept=".xlsx,.xls,.csv" onFile={onUpload} count={auditoria.length} onClear={onClear} loading={loading} />
+      </div>
+
+      {model.enriched.length === 0 ? (
+        <EmptyState icon={ShieldCheck} title="Importe primeiro as Vendas iBridge" desc="O quadro do funil é montado a partir do iBridge. Depois, ao subir a Auditoria, a coluna Auditoria é classificada automaticamente." />
+      ) : (
+        <>
+          {/* Alerta: vendas sem classificação */}
+          {auditoria.length > 0 && model.ibSemAud.length > 0 && (
+            <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 p-4">
+              <div className="flex items-center gap-2 text-sm font-semibold text-amber-800">
+                <AlertTriangle size={16} /> {fmtInt(model.ibSemAud.length)} vendas do iBridge ainda não foram auditadas — classificadas como “A verificar”.
+              </div>
+            </div>
+          )}
+          {model.audSemIb.length > 0 && (
+            <p className="mb-3 text-xs text-slate-500">⚠ {fmtInt(model.audSemIb.length)} registros de auditoria não têm venda correspondente no iBridge (CPF não localizado na etapa 1).</p>
+          )}
+
+          <FunilPanel model={model} />
+
+          {motivosTop.length > 0 && (
+            <div className="mt-4 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+              <SectionTitle>Principais motivos de recusa</SectionTitle>
+              <div className="space-y-2">
+                {motivosTop.map(([motivo, n], i) => (
+                  <div key={i} className="flex items-start justify-between gap-3 text-sm">
+                    <span className="text-slate-600">{motivo}…</span>
+                    <span className="shrink-0 rounded-full bg-rose-50 px-2 py-0.5 text-xs font-medium text-rose-700">{n}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </>
+  );
+}
+
+/* ---------- Vendas Creditadas (histórico de quinzenas) ---------- */
+function CreditadasView({ model, repasses, lerQuinzena, onAdd, onRemove, onClear, sessao, flash }) {
+  const isAdmin = sessao.papel === "admin";
+  const fileRef = useRef(null);
+  const [busy, setBusy] = useState(false);
+  const [form, setForm] = useState(null);   // { parsed, periodoIni, periodoFim, valorCreditado, dataPagamento, editId }
+  const [confirmDel, setConfirmDel] = useState(null);
+
+  const escolherArquivo = async (file) => {
+    if (!file) return;
+    setBusy(true);
+    try {
+      const { parsed, meta } = await lerQuinzena(file);
+      const quit = parsed.clientes.filter((c) => c.retorno === "CREDITADO").length;
+      const valorResumo = parsed.resumo.empresas.reduce((s, e) => s + (e.repasse || 0), 0);
+      setForm({
+        parsed,
+        nomeArquivo: file.name,
+        periodoIni: meta?.ini || "",
+        periodoFim: meta?.fim || "",
+        valorCreditado: meta?.valor ?? valorResumo ?? 0,
+        dataPagamento: "",
+        quit,
+        editId: null,
+      });
+    } catch (e) {
+      flash(e.message || "Falha ao ler a planilha.", false);
+    } finally { setBusy(false); if (fileRef.current) fileRef.current.value = ""; }
+  };
+
+  const salvar = async () => {
+    const fm = form;
+    if (!fm.periodoIni || !fm.periodoFim) return flash("Informe o período (início e fim) da quinzena.", false);
+    const id = fm.editId || `q_${fm.periodoIni}_${fm.periodoFim}`;
+    const entry = {
+      id, periodoIni: fm.periodoIni, periodoFim: fm.periodoFim,
+      label: labelQuinzena(fm.periodoIni, fm.periodoFim),
+      valorCreditado: Number(fm.valorCreditado) || 0,
+      dataPagamento: fm.dataPagamento || "",
+      clientes: fm.parsed.clientes, estornados: fm.parsed.estornados, resumo: fm.parsed.resumo,
+      criadoEm: Date.now(),
+    };
+    await onAdd(entry); setForm(null);
+  };
+
+  const editarMeta = (q) => setForm({
+    parsed: { clientes: q.clientes || [], estornados: q.estornados || [], resumo: q.resumo || { empresas: [] } },
+    nomeArquivo: q.label, periodoIni: q.periodoIni, periodoFim: q.periodoFim,
+    valorCreditado: q.valorCreditado, dataPagamento: q.dataPagamento || "",
+    quit: (q.clientes || []).filter((c) => c.retorno === "CREDITADO").length, editId: q.id,
+  });
+
+  const hist = [...model.carteira].reverse(); // mais recente primeiro
+
+  return (
+    <>
+      <PageHeader title="Vendas Creditadas" desc="Etapa 3 — a cada quinzena o parceiro envia a planilha de crédito. Suba planilha a planilha; o histórico (período, valor creditado e data de pagamento) fica salvo abaixo." />
+
+      {/* Upload de quinzena */}
+      <div className="mb-4 rounded-xl border-2 border-dashed border-slate-200 bg-white p-5">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <div className="flex items-center gap-2 text-sm font-semibold text-slate-800"><Upload size={16} style={{ color: BRAND.blue }} /> Subir planilha da quinzena</div>
+            <p className="mt-1 text-xs text-slate-500">Aceita os dois formatos do parceiro (Clientes/Resumo/Estornados ou CRÉDITO/RESUMO). Ao subir, confirme período, valor creditado e data de pagamento.</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv" className="hidden" onChange={(e) => escolherArquivo(e.target.files?.[0])} />
+            <button onClick={() => fileRef.current?.click()} disabled={busy}
+              className="flex items-center gap-1.5 rounded-lg px-4 py-2 text-sm font-semibold text-white disabled:opacity-60" style={{ background: BRAND.blue }}>
+              <Upload size={15} /> {busy ? "Lendo…" : "Selecionar planilha"}
+            </button>
+            {repasses.length > 0 && isAdmin && (
+              <button onClick={onClear} className="flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-500 hover:bg-slate-50"><Trash2 size={14} /> Limpar tudo</button>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Histórico de quinzenas */}
+      {repasses.length > 0 && (
+        <>
+          <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
+            <Kpi icon={Wallet} tone="emerald" label="Carteira total (repasse)" value={fmtBRL(model.carteiraTotal)} sub={`${fmtInt(model.carteira.length)} quinzenas`} />
+            <Kpi icon={Users} tone="blue" label="Clientes na carteira" value={fmtInt(model.clientesCreditados)} sub="CPFs já creditados" />
+            <Kpi icon={Repeat} tone="violet" label="Quitações no total" value={fmtInt(model.quitacoesTotal)} sub="1ª + recorrências" />
+            <Kpi icon={Clock} tone="amber" label="A receber (sem data pgto.)" value={fmtBRL(model.aReceber)} />
+          </div>
+
+          <div className="mb-5 overflow-hidden rounded-xl border border-slate-200 bg-white">
+            <div className="flex items-center justify-between border-b border-slate-100 px-4 py-2.5">
+              <span className="text-sm font-semibold text-slate-700">Histórico de quinzenas</span>
+              <span className="text-xs text-slate-400">{fmtInt(repasses.length)} períodos salvos</span>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead><tr className="border-b border-slate-100 bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+                  <th className="px-4 py-2.5">Quinzena</th><th className="px-4 py-2.5">Quitadas</th><th className="px-4 py-2.5">1ª venda</th><th className="px-4 py-2.5">Recorr.</th>
+                  <th className="px-4 py-2.5">Valor creditado</th><th className="px-4 py-2.5">Pagamento</th><th className="px-4 py-2.5 text-right">Ações</th>
+                </tr></thead>
+                <tbody>
+                  {hist.map((q) => (
+                    <tr key={q.id} className="border-b border-slate-50 last:border-0">
+                      <td className="px-4 py-2.5 font-medium text-slate-800">{q.label}</td>
+                      <td className="px-4 py-2.5">{fmtInt(q.quitadas)}</td>
+                      <td className="px-4 py-2.5"><span style={{ color: BRAND.blueDeep }}>{fmtInt(q.novas)}</span></td>
+                      <td className="px-4 py-2.5"><span className="text-violet-700">{fmtInt(q.recorrentes)}</span></td>
+                      <td className="px-4 py-2.5 font-medium text-emerald-700">{fmtBRL(q.valorCreditado)}</td>
+                      <td className="px-4 py-2.5 text-slate-500">{q.dataPagamento ? brFromISO(q.dataPagamento) : <span className="text-amber-500">pendente</span>}</td>
+                      <td className="px-4 py-2.5">
+                        {isAdmin && (
+                          <div className="flex items-center justify-end gap-1">
+                            <button onClick={() => editarMeta(q)} title="Editar dados" className="grid h-8 w-8 place-items-center rounded-lg text-slate-500 hover:bg-slate-100"><Pencil size={14} /></button>
+                            <button onClick={() => setConfirmDel(q)} title="Excluir quinzena" className="grid h-8 w-8 place-items-center rounded-lg text-rose-500 hover:bg-rose-50"><Trash2 size={14} /></button>
+                          </div>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot>
+                  <tr className="border-t border-slate-200 bg-slate-50 font-semibold text-slate-700">
+                    <td className="px-4 py-2.5">Total</td>
+                    <td className="px-4 py-2.5">{fmtInt(model.carteira.reduce((s, q) => s + q.quitadas, 0))}</td>
+                    <td className="px-4 py-2.5">{fmtInt(model.carteira.reduce((s, q) => s + q.novas, 0))}</td>
+                    <td className="px-4 py-2.5">{fmtInt(model.carteira.reduce((s, q) => s + q.recorrentes, 0))}</td>
+                    <td className="px-4 py-2.5 text-emerald-700">{fmtBRL(model.carteiraTotal)}</td>
+                    <td className="px-4 py-2.5" colSpan={2}></td>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* Quadro do funil */}
+      {model.enriched.length === 0 ? (
+        <EmptyState icon={CreditCard} title={repasses.length ? "Suba o iBridge para cruzar o funil" : "Comece subindo as quinzenas de crédito"}
+          desc="O quadro do funil é montado a partir do iBridge. Ao subir as quinzenas, a coluna 1º Crédito e o TIPO (1ª venda × recorrente) são classificados automaticamente." />
+      ) : (
+        <FunilPanel model={model} />
+      )}
+
+      {/* Modal de metadados da quinzena */}
+      {form && (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4" onClick={() => setForm(null)}>
+          <div className="w-full max-w-md rounded-2xl bg-white p-5 shadow-xl" onClick={(e) => e.stopPropagation()}>
+            <div className="mb-4 flex items-center justify-between">
+              <h3 className="text-base font-semibold text-slate-800">{form.editId ? "Editar quinzena" : "Confirmar quinzena"}</h3>
+              <button onClick={() => setForm(null)} className="text-slate-400 hover:text-slate-600"><X size={18} /></button>
+            </div>
+            <div className="mb-3 rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-600">
+              <div className="truncate">{form.nomeArquivo}</div>
+              <div className="mt-0.5 text-slate-400">{fmtInt(form.parsed.clientes.length)} registros · {fmtInt(form.quit)} quitados</div>
+            </div>
+            <div className="space-y-3">
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="Início da quinzena"><input type="date" value={form.periodoIni} onChange={(e) => setForm({ ...form, periodoIni: e.target.value })} className="inp" /></Field>
+                <Field label="Fim da quinzena"><input type="date" value={form.periodoFim} onChange={(e) => setForm({ ...form, periodoFim: e.target.value })} className="inp" /></Field>
+              </div>
+              <Field label="Valor creditado (R$)"><input type="number" step="0.01" value={form.valorCreditado} onChange={(e) => setForm({ ...form, valorCreditado: parseFloat(e.target.value) || 0 })} className="inp" /></Field>
+              <Field label="Data de pagamento para nós"><input type="date" value={form.dataPagamento} onChange={(e) => setForm({ ...form, dataPagamento: e.target.value })} className="inp" /></Field>
+            </div>
+            <div className="mt-4 flex justify-end gap-2">
+              <button onClick={() => setForm(null)} className="rounded-lg px-4 py-2 text-sm text-slate-600 hover:bg-slate-100">Cancelar</button>
+              <button onClick={salvar} className="flex items-center gap-1.5 rounded-lg px-4 py-2 text-sm font-semibold text-white" style={{ background: BRAND.blue }}><Check size={15} /> {form.editId ? "Salvar" : "Adicionar quinzena"}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {confirmDel && (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4" onClick={() => setConfirmDel(null)}>
+          <div className="w-full max-w-sm rounded-2xl bg-white p-5 shadow-xl" onClick={(e) => e.stopPropagation()}>
+            <h3 className="text-base font-semibold text-slate-800">Excluir quinzena</h3>
+            <p className="mt-2 text-sm text-slate-600">Remover <b>{confirmDel.label}</b> do histórico?</p>
+            <div className="mt-4 flex justify-end gap-2">
+              <button onClick={() => setConfirmDel(null)} className="rounded-lg px-4 py-2 text-sm text-slate-600 hover:bg-slate-100">Cancelar</button>
+              <button onClick={() => { onRemove(confirmDel.id); setConfirmDel(null); }} className="rounded-lg bg-rose-600 px-4 py-2 text-sm font-semibold text-white">Excluir</button>
+            </div>
+          </div>
+        </div>
+      )}
+      <style>{`.inp{width:100%;border:1px solid #cbd5e1;border-radius:.5rem;padding:.5rem .75rem;font-size:.875rem;outline:none}.inp:focus{border-color:#94a3b8}`}</style>
+    </>
+  );
+}
+
+/* ---------- Projeção (próximas quinzenas de pagamento) ---------- */
+function addDias(iso, n) { const d = new Date(iso + "T00:00:00"); d.setDate(d.getDate() + n); return d.toISOString().slice(0, 10); }
+function ultimoDiaMes(y, m) { return new Date(y, m, 0).getDate(); } // m = 1..12
+/* Gera as próximas N quinzenas a partir da última conhecida, com data de pagamento (25 da própria quinzena 01-15; 15 do mês seguinte para a 16-fim) */
+function proximasQuinzenas(ultimaFimISO, n) {
+  const out = [];
+  let [y, m, d] = (ultimaFimISO || mesAtualISO() + "-15").split("-").map(Number);
+  let segundaMetade = d >= 16; // se a última terminou no fim do mês, a próxima é 01-15 do mês seguinte
+  for (let i = 0; i < n; i++) {
+    if (segundaMetade) { m += 1; if (m > 12) { m = 1; y += 1; } } // próxima é 01-15
+    const primeira = segundaMetade ? true : false; // alterna
+    let ini, fim, pagamento;
+    if (segundaMetade) {
+      ini = `${y}-${String(m).padStart(2, "0")}-01`;
+      fim = `${y}-${String(m).padStart(2, "0")}-15`;
+      pagamento = `${y}-${String(m).padStart(2, "0")}-25`;
+      segundaMetade = false;
+    } else {
+      const ld = ultimoDiaMes(y, m);
+      ini = `${y}-${String(m).padStart(2, "0")}-16`;
+      fim = `${y}-${String(m).padStart(2, "0")}-${ld}`;
+      let pm = m + 1, py = y; if (pm > 12) { pm = 1; py += 1; }
+      pagamento = `${py}-${String(pm).padStart(2, "0")}-15`;
+      segundaMetade = true;
+    }
+    out.push({ ini, fim, pagamento, label: labelQuinzena(ini, fim) });
+  }
+  return out;
+}
+
+function ProjecaoView({ model, planoValor, comissaoPct, campanhas }) {
+  const cart = model.carteira; // quinzenas históricas (cronológico)
+  const N_FUT = 4;
+
+  const proj = useMemo(() => {
+    if (!cart.length) return null;
+    const ult = cart.slice(-Math.min(4, cart.length)); // últimas até 4 quinzenas
+    const mediaNovas = Math.round(ult.reduce((s, q) => s + q.novas, 0) / ult.length);
+    const ultima = cart[cart.length - 1];
+    let baseRecorrente = model.clientesCreditados; // carteira ativa atual (CPFs já creditados)
+    const recorrenteUnit = planoValor * comissaoPct;             // 30%
+    const futuras = proximasQuinzenas(ultima.periodoFim || ultima.periodoIni, N_FUT);
+    const linhas = futuras.map((q) => {
+      const camp = campanhaDaData(campanhas, q.fim);
+      const novaUnit = planoValor * (camp ? camp.pctPrimeira : comissaoPct);
+      const valRec = baseRecorrente * recorrenteUnit;
+      const valNova = mediaNovas * novaUnit;
+      const total = valRec + valNova;
+      const linha = { ...q, recorrentes: baseRecorrente, novas: mediaNovas, valRec, valNova, total, campanha: camp?.nome || null };
+      baseRecorrente += mediaNovas; // novas entram na carteira recorrente nas próximas quinzenas
+      return linha;
+    });
+    const totalProj = linhas.reduce((s, l) => s + l.total, 0);
+    return { mediaNovas, recorrenteUnit, linhas, totalProj, baseInicial: model.clientesCreditados };
+  }, [cart, model, planoValor, comissaoPct, campanhas]);
+
+  const chartData = useMemo(() => {
+    const hist = cart.map((q) => ({ label: labelMes(mesDeISO(q.periodoFim || q.periodoIni)), tipo: "Realizado", valor: q.valorCreditado }));
+    const fut = proj ? proj.linhas.map((l) => ({ label: labelMes(mesDeISO(l.fim)) + (l.fim.endsWith("15") ? " Q1" : " Q2"), tipo: "Projetado", valor: l.total })) : [];
+    return [...hist, ...fut];
+  }, [cart, proj]);
+
+  return (
+    <>
+      <PageHeader title="Projeção" desc="Projeção dos próximos repasses (pagamentos dia 15 e 25): carteira recorrente fixa + novas entradas pela média das últimas quinzenas." />
+
+      {!cart.length ? (
+        <EmptyState icon={TrendingUp} title="Sem dados de crédito ainda" desc="Suba as quinzenas no menu Vendas Creditadas para projetar os próximos repasses." />
+      ) : (
+        <>
+          <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+            <Kpi icon={Users} tone="blue" label="Carteira recorrente atual" value={fmtInt(proj.baseInicial)} sub="CPFs já creditados" />
+            <Kpi icon={Plus} tone="violet" label="Novas / quinzena (média)" value={fmtInt(proj.mediaNovas)} sub="últimas quinzenas" />
+            <Kpi icon={Coins} tone="teal" label="Repasse recorrente / cliente" value={fmtBRL(proj.recorrenteUnit)} sub={`${Math.round(comissaoPct * 100)}% de ${fmtBRL(planoValor)}`} />
+            <Kpi icon={Wallet} tone="emerald" label={`Projeção ${N_FUT} quinzenas`} value={fmtBRL(proj.totalProj)} />
+          </div>
+
+          <div className="mt-5 overflow-hidden rounded-xl border border-slate-200 bg-white">
+            <div className="border-b border-slate-100 px-4 py-2.5 text-sm font-semibold text-slate-700">Próximos repasses projetados</div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead><tr className="border-b border-slate-100 bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+                  <th className="px-4 py-2.5">Quinzena</th><th className="px-4 py-2.5">Pagamento</th><th className="px-4 py-2.5">Recorrentes</th><th className="px-4 py-2.5">Novas</th>
+                  <th className="px-4 py-2.5">Recorrente (R$)</th><th className="px-4 py-2.5">Novas (R$)</th><th className="px-4 py-2.5">Total quinzena</th>
+                </tr></thead>
+                <tbody>
+                  {proj.linhas.map((l, i) => (
+                    <tr key={i} className="border-b border-slate-50 last:border-0">
+                      <td className="px-4 py-2.5 font-medium text-slate-800">{l.label}{l.campanha && <span className="ml-1 rounded-full bg-emerald-50 px-1.5 py-0.5 text-[10px] text-emerald-700">campanha</span>}</td>
+                      <td className="px-4 py-2.5 text-slate-600">{brFromISO(l.pagamento)}</td>
+                      <td className="px-4 py-2.5">{fmtInt(l.recorrentes)}</td>
+                      <td className="px-4 py-2.5">{fmtInt(l.novas)}</td>
+                      <td className="px-4 py-2.5 text-slate-600">{fmtBRL(l.valRec)}</td>
+                      <td className="px-4 py-2.5 text-slate-600">{fmtBRL(l.valNova)}</td>
+                      <td className="px-4 py-2.5 font-semibold text-emerald-700">{fmtBRL(l.total)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div className="mt-5 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+            <SectionTitle>Carteira realizada × projetada</SectionTitle>
+            <ResponsiveContainer width="100%" height={300}>
+              <BarChart data={chartData}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#eef2f7" />
+                <XAxis dataKey="label" tick={{ fontSize: 10 }} angle={-25} textAnchor="end" height={60} />
+                <YAxis tick={{ fontSize: 11 }} />
+                <Tooltip formatter={(v) => fmtBRL(v)} />
+                <Bar dataKey="valor" radius={[3, 3, 0, 0]} name="Repasse">
+                  {chartData.map((d, i) => <Cell key={i} fill={d.tipo === "Projetado" ? BRAND.teal : BRAND.blue} />)}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+            <p className="mt-2 text-xs text-slate-400">Azul = realizado (planilhas do parceiro) · Verde-água = projetado. Premissa: recorrência a {Math.round(comissaoPct * 100)}% e novas a {fmtInt(proj.mediaNovas)}/quinzena (1ª venda a 50% quando há campanha vigente).</p>
+          </div>
+        </>
+      )}
+    </>
+  );
+}
+
+/* ---------- Relatórios ---------- */
+function RelatoriosView({ model, repasses }) {
+  const exportXlsx = (rows, sheetName, fileName) => {
+    const ws = XLSX.utils.json_to_sheet(rows);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, sheetName);
+    XLSX.writeFile(wb, fileName);
+  };
+
+  const funilCompleto = model.enriched.map((v) => ({
+    Data: v.dataBR, Hora: v.hora, Cliente: v.nome, CPF: v.cpf, Tipo: v.recorrencia === "NOVA" ? "1ª venda" : "Recorrente",
+    Operador: v.operador, Equipe: v.equipe, Telefone: v.telefone,
+    Auditoria: STATUS_THEME[v.statusAud]?.label || v.statusAud,
+    Primeiro_Credito: v.statusCred ? (STATUS_THEME[v.statusCred]?.label || v.statusCred) : "",
+    Estornado: v.estornado ? "Sim" : "Não", Motivo_Auditoria: v.motivoAud,
+  }));
+  const aVerificar = model.ibSemAud.map((v) => ({ Data: v.dataBR, Cliente: v.nome, CPF: v.cpf, Operador: v.operador, Equipe: v.equipe, Telefone: v.telefone, Situacao: "Sem auditoria – verificar" }));
+  const carteiraRows = model.carteira.map((q) => ({ Quinzena: q.label, Quitadas: q.quitadas, Primeira_Venda: q.novas, Recorrentes: q.recorrentes, Valor_Creditado: q.valorCreditado, Data_Pagamento: q.dataPagamento ? brFromISO(q.dataPagamento) : "" }));
+
+  const f = model.funnel;
+  const consolidado = [
+    { Indicador: "Fechamentos (registros)", Valor: f.fechamentosRegistros },
+    { Indicador: "Clientes únicos", Valor: f.clientesUnicos },
+    { Indicador: "Aprovadas na auditoria", Valor: f.aprovadas },
+    { Indicador: "Recusadas na auditoria", Valor: f.recusadas },
+    { Indicador: "A verificar", Valor: f.verificar },
+    { Indicador: "iBridge sem auditoria", Valor: f.pendente },
+    { Indicador: "Creditadas (vidas)", Valor: f.creditadas },
+    { Indicador: "Em trânsito", Valor: f.emTransito },
+    { Indicador: "Carteira total (R$)", Valor: model.carteiraTotal },
+    { Indicador: "Clientes na carteira", Valor: model.clientesCreditados },
+    { Indicador: "Estornos (R$)", Valor: model.estTotal },
+    { Indicador: "Comissão total creditada (R$)", Valor: model.comissao.total },
+  ];
+
+  const reports = [
+    { title: "Funil completo", desc: "Todas as vendas do iBridge com TIPO, auditoria e 1º crédito.", n: funilCompleto.length, on: () => exportXlsx(funilCompleto, "Funil", "Cred_GT_Funil_Completo.xlsx"), icon: Database, disabled: !funilCompleto.length },
+    { title: "Vendas a verificar", desc: "Vendas do iBridge sem correspondência na auditoria.", n: aVerificar.length, on: () => exportXlsx(aVerificar, "A Verificar", "Cred_GT_A_Verificar.xlsx"), icon: AlertTriangle, disabled: !aVerificar.length },
+    { title: "Carteira por quinzena", desc: "Histórico de crédito: período, quitadas, 1ª venda × recorrente, valor.", n: carteiraRows.length, on: () => exportXlsx(carteiraRows, "Carteira", "Cred_GT_Carteira.xlsx"), icon: CreditCard, disabled: !carteiraRows.length },
+    { title: "Resumo consolidado", desc: "Indicadores-chave do funil em uma planilha.", n: consolidado.length, on: () => exportXlsx(consolidado, "Resumo", "Cred_GT_Resumo.xlsx"), icon: FileText, disabled: !f.fechamentosRegistros },
+  ];
+
+  return (
+    <>
+      <PageHeader title="Relatórios" desc="Exporte o funil e os indicadores para Excel." />
+      <div className="grid gap-3 sm:grid-cols-2">
+        {reports.map((r, i) => (
+          <div key={i} className="flex items-center justify-between gap-4 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+            <div className="flex items-start gap-3">
+              <span className="grid h-10 w-10 place-items-center rounded-lg bg-slate-100 text-slate-500"><r.icon size={18} /></span>
+              <div>
+                <h3 className="text-sm font-semibold text-slate-800">{r.title}</h3>
+                <p className="mt-0.5 text-xs text-slate-500">{r.desc}</p>
+                <span className="mt-1 inline-block text-xs text-slate-400">{fmtInt(r.n)} linhas</span>
+              </div>
+            </div>
+            <button onClick={r.on} disabled={r.disabled}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3 py-2 text-xs font-medium text-white hover:bg-slate-700 disabled:opacity-40">
+              <Download size={14} /> Baixar
+            </button>
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
+
+
+import { createRoot } from "react-dom/client";
+const _root = createRoot(document.getElementById("root"));
+_root.render(React.createElement(App));
+
+</script>
+</body>
+</html>
