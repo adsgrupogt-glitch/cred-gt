@@ -2258,13 +2258,23 @@ function ProjecaoView({ model, planoValor, comissaoPct, campanhas, metaMensal, s
     const qIdx = A.qIdx;
     const primeiroFi = A.qIdx(futuras[0].fim);
 
-    // Safras de venda: histórico recente ainda maturando + futuras pela meta
+    // Safras de venda (entradas no iBridge):
+    //  • Meses JÁ FECHADOS  -> usam o REALIZADO (com a defasagem real de maturação).
+    //  • Mês EM ANDAMENTO   -> usa a META (piso), para o início do mês não puxar a projeção para baixo.
+    //                          Se o realizado parcial já superar a meta, usa o realizado (nunca subestima).
+    //  • Meses FUTUROS      -> usam a META.
+    // Quando o mês vira, ele deixa de ser "em andamento" e passa a entrar como realizado automaticamente.
+    const mAtual = mesAtualISO();
     const cohorts = [];
-    // recentes já vendidas (últimos 3 meses do iBridge) — maturação restante
-    for (const vm of A.vendasPorMes.slice(-3)) cohorts.push({ mes: vm.mes, vendas: vm.qtd });
-    // futuras: do próximo mês em diante (4 meses), volume = meta
-    let [y, m] = (A.vendasPorMes[A.vendasPorMes.length - 1]?.mes || mesAtualISO()).split("-").map(Number);
-    for (let i = 0; i < 4; i++) { m += 1; if (m > 12) { m = 1; y += 1; } cohorts.push({ mes: `${y}-${String(m).padStart(2, "0")}`, vendas: meta, futura: true }); }
+    const passados = A.vendasPorMes.filter((vm) => vm.mes < mAtual);
+    for (const vm of passados.slice(-3)) cohorts.push({ mes: vm.mes, vendas: vm.qtd, base: "real" });
+    const realAtual = A.vendasPorMes.find((vm) => vm.mes === mAtual)?.qtd || 0;
+    let [y, m] = mAtual.split("-").map(Number);
+    for (let i = 0; i < 5; i++) {
+      const mm = `${y}-${String(m).padStart(2, "0")}`;
+      cohorts.push({ mes: mm, vendas: i === 0 ? Math.max(meta, realAtual) : meta, base: "meta", futura: i > 0 });
+      m += 1; if (m > 12) { m = 1; y += 1; }
+    }
 
     let baseAtiva = model.clientesCreditados;
     // ÂNCORA: a recorrência parte do nível REAL da última quinzena (não recria de uma base pequena).
@@ -2354,7 +2364,9 @@ function ProjecaoView({ model, planoValor, comissaoPct, campanhas, metaMensal, s
                     className="w-28 rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-400" />
                   <button onClick={salvarMeta} className="rounded-lg px-3 py-2 text-xs font-semibold text-white" style={{ background: BRAND.blue }}>Salvar</button>
                 </div>
-                <div className="mt-1 text-[11px] text-slate-400">Tendência: {A.vendasPorMes.map((v) => v.qtd).join(" → ")}</div>
+                <div className="mt-1 text-[11px] text-slate-400">
+                  Realizado: {A.vendasPorMes.filter((v) => v.mes < mesAtualISO()).map((v) => v.qtd).join(" → ") || "—"} · mês atual projetado pela meta
+                </div>
               </div>
               <div>
                 <label className="mb-1.5 block text-xs font-medium text-slate-600">Campanha 50%</label>
